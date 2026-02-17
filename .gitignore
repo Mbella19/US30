@@ -1,0 +1,98 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data files (Exclude entire directory)
+data/
+!src/data/
+
+# Model checkpoints (Exclude entire directory to avoid large binaries)
+models/
+*.pt
+*.pth
+*.zip
+!atlas funding/**/*.zip
+*.pkl
+
+# Results and Logs
+results/
+*.log
+logs/
+
+# AI Tool Artifacts
+.aider*
+.gemini*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+
+# Private stock data
+stocks/
+
+# Pepperstone model artifacts
+Pepperstone/
+
+# Large binary/media files
+*.pdf
+*.png
+
+# Debug artifacts
+debug_output.txt
+
+# Tool/cache directories
+.cache/
+.claude/
+.pytest_cache/
+.mplconfig/
+
+# Numpy archives (checkpoints)
+*.npz
