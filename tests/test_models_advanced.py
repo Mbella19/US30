@@ -201,27 +201,6 @@ class TestEncoders:
         assert output.shape == (batch_size, d_model), \
             f"Encoder output {output.shape} != expected ({batch_size}, {d_model})"
 
-    def test_lightweight_encoder_output_shape(self):
-        """LightweightEncoder should produce correct output shape."""
-        from src.models.encoders import LightweightEncoder
-
-        input_dim = 19
-        hidden_dim = 64
-        batch_size = 4
-        seq_len = 48
-
-        encoder = LightweightEncoder(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim
-        )
-
-        x = torch.randn(batch_size, seq_len, input_dim)
-
-        with torch.no_grad():
-            output = encoder(x)
-
-        assert output.shape == (batch_size, hidden_dim), \
-            f"Lightweight encoder output shape mismatch"
 
 
 # =============================================================================
@@ -264,24 +243,6 @@ class TestFusion:
             # After mean over heads, sum over keys
             assert weights.dim() >= 2, "Attention weights should be at least 2D"
 
-    def test_concat_fusion_output_shape(self):
-        """ConcatFusion should produce correct output shape."""
-        from src.models.fusion import ConcatFusion
-
-        d_model = 64
-        batch_size = 4
-
-        fusion = ConcatFusion(d_model=d_model)
-
-        x_15m = torch.randn(batch_size, d_model)
-        x_1h = torch.randn(batch_size, d_model)
-        x_4h = torch.randn(batch_size, d_model)
-
-        with torch.no_grad():
-            output = fusion(x_15m, x_1h, x_4h)
-
-        assert output.shape == (batch_size, d_model), \
-            "ConcatFusion output shape mismatch"
 
 
 # =============================================================================

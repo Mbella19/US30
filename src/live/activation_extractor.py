@@ -94,7 +94,7 @@ class ActivationExtractor:
 
         Args:
             analyst: TCN Analyst model (can be None if analyst is disabled)
-            agent: SniperAgent or RecurrentSniperAgent instance
+            agent: SniperAgent instance
         """
         self.analyst = analyst
         self.agent = agent

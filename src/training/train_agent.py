@@ -37,12 +37,11 @@ from stable_baselines3.common.callbacks import BaseCallback
 from ..models.analyst import load_analyst, MarketAnalyst
 from ..environments.trading_env import TradingEnv
 from ..environments.env_factory import make_vec_env, prepare_env_kwargs_for_vectorization
-from ..agents.sniper_agent import SniperAgent, create_agent, create_agent_with_config
+from ..agents.sniper_agent import SniperAgent, create_agent
 from ..utils.logging_config import setup_logging, get_logger
 from ..utils.metrics import calculate_trading_metrics, TradingMetrics
 from ..utils.callbacks import AgentTrainingLogger, GradientNormCallback
 from ..data.features import (
-    compute_regime_labels,
     add_market_sessions,
     detect_fractals,
     detect_structure_breaks
@@ -292,8 +291,6 @@ def create_trading_env(
     device: Optional[torch.device] = None,
     market_feat_mean: Optional[np.ndarray] = None,
     market_feat_std: Optional[np.ndarray] = None,
-    regime_labels: Optional[np.ndarray] = None,
-    use_regime_sampling: bool = True,
     precomputed_analyst_cache: Optional[dict] = None,
     ohlc_data: Optional[np.ndarray] = None,
     timestamps: Optional[np.ndarray] = None,
@@ -320,8 +317,6 @@ def create_trading_env(
     # Default configuration (matches config/settings.py TradingConfig)
     spread_pips = 10.0              # config.trading.spread_pips
     slippage_pips = 0.0             # config.trading.slippage_pips
-    fomo_penalty = 0.0              # DEPRECATED - now using opportunity cost
-    chop_penalty = 0.0              # Disabled
     fomo_threshold_atr = 4.0        # config.trading.fomo_threshold_atr
     fomo_lookback_bars = 24         # config.trading.fomo_lookback_bars
     chop_threshold = 80.0           # config.trading.chop_threshold
@@ -329,7 +324,6 @@ def create_trading_env(
     reward_scaling = 0.01           # config.trading.reward_scaling
     context_dim = 32                # config.analyst.context_dim
     trade_entry_bonus = 0.1         # config.trading.trade_entry_bonus
-    holding_bonus = 0.0             # config.trading.holding_bonus (DEPRECATED)
     noise_level = 0.05              # Moderate regularization noise
     # Alpha-Based Reward and Symmetric PnL Scaling
     profit_scaling = 0.01           # config.trading.profit_scaling
@@ -347,13 +341,6 @@ def create_trading_env(
     volatility_sizing = True
     risk_per_trade = 100.0          # config.trading.risk_per_trade
 
-    # Analyst Alignment
-    enforce_analyst_alignment = False  # config.trading.enforce_analyst_alignment
-
-    # Sparse Rewards (DEPRECATED)
-    use_sparse_rewards = False      # config.trading.use_sparse_rewards (DEPRECATED)
-    # Loss Tolerance Buffer
-    loss_tolerance_atr = 1.0        # config.trading.loss_tolerance_atr
     # Minimum Hold Time
     min_hold_bars = 0               # config.trading.min_hold_bars
     # Profit-based early exit override
@@ -370,8 +357,6 @@ def create_trading_env(
         trading_cfg = getattr(config, 'trading', config)
         spread_pips = getattr(trading_cfg, 'spread_pips', spread_pips)
         slippage_pips = getattr(trading_cfg, 'slippage_pips', slippage_pips)
-        fomo_penalty = getattr(trading_cfg, 'fomo_penalty', fomo_penalty)
-        chop_penalty = getattr(trading_cfg, 'chop_penalty', chop_penalty)
         fomo_threshold_atr = getattr(trading_cfg, 'fomo_threshold_atr', fomo_threshold_atr)
         fomo_lookback_bars = getattr(trading_cfg, 'fomo_lookback_bars', fomo_lookback_bars)
         chop_threshold = getattr(trading_cfg, 'chop_threshold', chop_threshold)
@@ -382,22 +367,14 @@ def create_trading_env(
         tp_atr_multiplier = getattr(trading_cfg, 'tp_atr_multiplier', tp_atr_multiplier)
         use_stop_loss = getattr(trading_cfg, 'use_stop_loss', use_stop_loss)
         use_take_profit = getattr(trading_cfg, 'use_take_profit', use_take_profit)
-        # Analyst Alignment
-        enforce_analyst_alignment = getattr(trading_cfg, 'enforce_analyst_alignment', enforce_analyst_alignment)
         # Trade entry bonus
         trade_entry_bonus = getattr(trading_cfg, 'trade_entry_bonus', trade_entry_bonus)
-        # Holding bonus
-        holding_bonus = getattr(trading_cfg, 'holding_bonus', holding_bonus)
         noise_level = getattr(trading_cfg, 'noise_level', noise_level)
         # Alpha-Based Reward and Asymmetric PnL Scaling
         profit_scaling = getattr(trading_cfg, 'profit_scaling', profit_scaling)
         loss_scaling = getattr(trading_cfg, 'loss_scaling', loss_scaling)
         use_alpha_reward = getattr(trading_cfg, 'use_alpha_reward', use_alpha_reward)
         alpha_baseline_exposure = getattr(trading_cfg, 'alpha_baseline_exposure', alpha_baseline_exposure)
-        # Sparse Rewards
-        use_sparse_rewards = getattr(trading_cfg, 'use_sparse_rewards', use_sparse_rewards)
-        # Loss Tolerance Buffer
-        loss_tolerance_atr = getattr(trading_cfg, 'loss_tolerance_atr', loss_tolerance_atr)
         # Minimum Hold Time
         min_hold_bars = getattr(trading_cfg, 'min_hold_bars', min_hold_bars)
         # Profit-based early exit override
@@ -410,11 +387,9 @@ def create_trading_env(
         rolling_norm_min_samples = getattr(trading_cfg, 'rolling_norm_min_samples', rolling_norm_min_samples)
 
         # Log config values to verify they're applied
-        logger.info(f"Config applied: fomo_penalty={fomo_penalty}, reward_scaling={reward_scaling}, "
+        logger.info(f"Config applied: reward_scaling={reward_scaling}, "
                     f"slippage_pips={slippage_pips}, trade_entry_bonus={trade_entry_bonus}, "
-                    f"enforce_analyst_alignment={enforce_analyst_alignment}, noise_level={noise_level}, "
-                    f"use_sparse_rewards={use_sparse_rewards}, loss_tolerance_atr={loss_tolerance_atr}, "
-                    f"min_hold_bars={min_hold_bars}")
+                    f"noise_level={noise_level}, min_hold_bars={min_hold_bars}")
         # Log SL/TP values to verify 1:2 R/R is applied
         logger.info(f"SL/TP config: sl_atr_multiplier={sl_atr_multiplier}, tp_atr_multiplier={tp_atr_multiplier} "
                     f"(R/R ratio: 1:{tp_atr_multiplier/sl_atr_multiplier:.1f})")
@@ -436,15 +411,12 @@ def create_trading_env(
         context_dim=context_dim,
         spread_pips=spread_pips,
         slippage_pips=slippage_pips,
-        fomo_penalty=fomo_penalty,
-        chop_penalty=chop_penalty,
         fomo_threshold_atr=fomo_threshold_atr,
         fomo_lookback_bars=fomo_lookback_bars,
         chop_threshold=chop_threshold,
         max_steps=max_steps,
-        reward_scaling=reward_scaling,  # FIX: Use local variable, not config directly
-        trade_entry_bonus=trade_entry_bonus,  # Exploration bonus
-        holding_bonus=holding_bonus,  # Bonus for holding profitable trades
+        reward_scaling=reward_scaling,
+        trade_entry_bonus=trade_entry_bonus,
         # Alpha-Based Reward and Asymmetric PnL Scaling
         profit_scaling=profit_scaling,
         loss_scaling=loss_scaling,
@@ -459,20 +431,11 @@ def create_trading_env(
         tp_atr_multiplier=tp_atr_multiplier,
         use_stop_loss=use_stop_loss,
         use_take_profit=use_take_profit,
-        # Regime-balanced sampling
-        regime_labels=regime_labels,
-        use_regime_sampling=use_regime_sampling,
         # Volatility Sizing (Dollar-based risk)
         volatility_sizing=volatility_sizing,
         risk_per_trade=risk_per_trade,
         # Classification mode
         num_classes=num_classes,
-        # Analyst Alignment
-        enforce_analyst_alignment=enforce_analyst_alignment,
-        # Sparse Rewards
-        use_sparse_rewards=use_sparse_rewards,
-        # Loss Tolerance Buffer
-        loss_tolerance_atr=loss_tolerance_atr,
         # Minimum Hold Time
         min_hold_bars=min_hold_bars,
         # Profit-based early exit override
@@ -511,12 +474,9 @@ def train_agent(
     device: Optional[torch.device] = None,
     total_timesteps: int = 500_000,
     resume_path: Optional[str] = None
-) -> Tuple[Union['SniperAgent', 'RecurrentSniperAgent'], Dict]:
+) -> Tuple[SniperAgent, Dict]:
     """
     Main function to train the PPO Sniper Agent.
-
-    Supports both standard PPO (SniperAgent) and RecurrentPPO (RecurrentSniperAgent)
-    based on config.recurrent_agent.use_recurrent setting.
 
     Args:
         df_5m: 5-minute DataFrame with features (base timeframe)
@@ -762,36 +722,6 @@ def train_agent(
         warmup_start = max(0, split_idx - rolling_window_size)
         rolling_warmup_eval = market_features[warmup_start:split_idx].astype(np.float32)
 
-    # Compute regime labels for regime-balanced episode starts (training data only).
-    # IMPORTANT: Match the regime look-ahead horizon to the episode horizon so a sampled
-    # "Bearish" (or "Bullish") episode actually tends to move in that direction over the
-    # full episode length.
-    max_steps_per_episode = getattr(config.trading, "max_steps_per_episode", 500) if config else 500
-    use_regime_sampling_train = getattr(config.trading, "use_regime_sampling", True) if config else True
-    train_regime_labels = None  # Default to None
-    
-    if use_regime_sampling_train:
-        logger.info(
-            "Computing regime labels for balanced sampling "
-            f"(forward_window={max_steps_per_episode} bars)..."
-        )
-        # Align regime labels to the same trimmed segment used by the environment.
-        env_df_5m = df_5m.iloc[start_idx:start_idx + n_samples]
-        train_regime_labels = compute_regime_labels(
-            env_df_5m.iloc[:split_idx],
-            lookback=20,
-            forward_window=max_steps_per_episode,
-        )
-        regime_counts = {
-            'Bullish': (train_regime_labels == 0).sum(),
-            'Ranging': (train_regime_labels == 1).sum(),
-            'Bearish': (train_regime_labels == 2).sum()
-        }
-        logger.info(f"Regime distribution: {regime_counts}")
-        logger.info("Regime sampling ENABLED: Agent will see 33% Bullish, 33% Ranging, 33% Bearish")
-    else:
-        logger.info("Regime sampling DISABLED: Using random episode starts")
-
     # Try to load pre-computed Analyst cache for sequential context (only if use_analyst=True)
     analyst_cache_path = Path(save_path).parent.parent / 'data' / 'processed' / 'analyst_cache.npz'
     train_analyst_cache = None
@@ -868,8 +798,6 @@ def train_agent(
             config=config,
             market_feat_mean=market_feat_mean,
             market_feat_std=market_feat_std,
-            regime_labels=train_regime_labels,
-            use_regime_sampling=use_regime_sampling_train,
             precomputed_analyst_cache=train_analyst_cache,
             ohlc_data=train_ohlc,
             timestamps=viz_timestamps,
@@ -900,8 +828,6 @@ def train_agent(
             device=device,
             market_feat_mean=market_feat_mean,
             market_feat_std=market_feat_std,
-            regime_labels=train_regime_labels,
-            use_regime_sampling=use_regime_sampling_train,
             precomputed_analyst_cache=train_analyst_cache,
             ohlc_data=train_ohlc,
             timestamps=viz_timestamps,
@@ -925,8 +851,6 @@ def train_agent(
         device=device,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
-        regime_labels=None,
-        use_regime_sampling=False,
         precomputed_analyst_cache=eval_analyst_cache,
         ohlc_data=eval_ohlc,            # Real OHLC for visualization
         timestamps=eval_timestamps,      # Real timestamps for visualization
@@ -945,19 +869,6 @@ def train_agent(
         logger.info(f"Observation space: {train_env.observation_space}")
         logger.info(f"Action space: {train_env.action_space}")
 
-    # Detect recurrent mode from config
-    recurrent_cfg = getattr(config, 'recurrent_agent', None) if config else None
-    use_recurrent = recurrent_cfg.use_recurrent if recurrent_cfg else False
-
-    if use_recurrent:
-        logger.info("=" * 70)
-        logger.info("RECURRENT PPO (LSTM) MODE - EXPERIMENTAL")
-        logger.info("=" * 70)
-        logger.info(f"  LSTM hidden_size: {recurrent_cfg.lstm_hidden_size}")
-        logger.info(f"  n_lstm_layers: {recurrent_cfg.n_lstm_layers}")
-        logger.info(f"  n_steps: {recurrent_cfg.n_steps}, batch_size: {recurrent_cfg.batch_size}")
-        logger.info("=" * 70)
-
     # Create agent
     reset_timesteps = True
     remaining_timesteps = total_timesteps
@@ -972,18 +883,13 @@ def train_agent(
 
         logger.info(f"Resuming agent from checkpoint: {resume_p}")
         try:
-            if use_recurrent:
-                from ..agents.recurrent_agent import RecurrentSniperAgent
-                agent = RecurrentSniperAgent.load(str(resume_p), env=train_env, device=device)
-            else:
-                agent = SniperAgent.load(str(resume_p), env=train_env, device=device)
+            agent = SniperAgent.load(str(resume_p), env=train_env, device=device)
         except Exception as e:
             logger.error(
                 "Failed to resume from checkpoint. Most common causes:\n"
                 "- Observation space changed (e.g. added/removed features, changed `agent_lookback_window`, "
                 "or market feature columns)\n"
                 "- Action space changed\n"
-                "- Model type mismatch (PPO vs RecurrentPPO)\n"
                 f"Checkpoint: {resume_p}\n"
                 f"Env obs shape: {getattr(train_env.observation_space, 'shape', None)}\n"
                 f"Env action space: {train_env.action_space}\n"
@@ -1024,12 +930,9 @@ def train_agent(
         agent.model.tensorboard_log = str(log_dir / "tb_logs")
 
     else:
-        if use_recurrent:
-            logger.info("Creating RecurrentPPO (LSTM) agent...")
-        else:
-            logger.info("Creating PPO agent...")
+        logger.info("Creating PPO agent...")
         tb_log_dir = str(log_dir / "tb_logs")
-        agent = create_agent_with_config(train_env, config, device=device, tensorboard_log=tb_log_dir)
+        agent = create_agent(train_env, config.agent if config else None, device=device, tensorboard_log=tb_log_dir)
         remaining_timesteps = total_timesteps
         reset_timesteps = True
 
@@ -1113,15 +1016,6 @@ def train_agent(
         'augmentation_applied': use_vol_augmentation,
         'augmentation_ratio': vol_augment_ratio if use_vol_augmentation else 0.0,
     }
-
-    # Add regime distribution if computed
-    if train_regime_labels is not None:
-        unique, counts = np.unique(train_regime_labels, return_counts=True)
-        regime_dist = {str(int(u)): int(c) for u, c in zip(unique, counts)}
-        total = sum(counts)
-        regime_ratios = {str(int(u)): float(c) / total for u, c in zip(unique, counts)}
-        training_stats['regime_distribution'] = regime_dist
-        training_stats['regime_ratios'] = regime_ratios
 
     stats_path = log_dir / 'training_stats.json'
     with open(stats_path, 'w') as f:

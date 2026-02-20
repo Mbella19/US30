@@ -38,7 +38,6 @@ from src.data.features import (
     detect_fractals,
     detect_structure_breaks,
     create_auxiliary_targets,
-    create_multi_horizon_targets,
 )
 from src.data.resampler import resample_all_timeframes, align_timeframes, create_multi_timeframe_dataset
 from src.data.normalizer import normalize_multi_timeframe
@@ -82,9 +81,7 @@ class MultiTimeframeDataset(Dataset):
         valid_mask: Optional[pd.Series] = None,
         volatility_target: Optional[pd.Series] = None,
         regime_target: Optional[pd.Series] = None,
-        is_binary: bool = False,
-        horizon_1h_target: Optional[pd.Series] = None,
-        horizon_2h_target: Optional[pd.Series] = None
+        is_binary: bool = False
     ):
         """
         Args:
@@ -101,8 +98,6 @@ class MultiTimeframeDataset(Dataset):
             volatility_target: Optional volatility target for auxiliary loss
             regime_target: Optional regime target for auxiliary loss
             is_binary: Whether this is binary classification
-            horizon_1h_target: Optional 1H horizon binary target (for multi-horizon)
-            horizon_2h_target: Optional 2H horizon binary target (for multi-horizon)
         """
         self.lookback_5m = lookback_5m
         self.lookback_15m = lookback_15m
@@ -128,15 +123,6 @@ class MultiTimeframeDataset(Dataset):
         else:
             self.volatility_target = None
             self.regime_target = None
-
-        # Multi-horizon targets (optional, for addressing target mismatch)
-        self.has_multi_horizon = horizon_1h_target is not None and horizon_2h_target is not None
-        if self.has_multi_horizon:
-            self.horizon_1h_target = horizon_1h_target.values.astype(np.float32)
-            self.horizon_2h_target = horizon_2h_target.values.astype(np.float32)
-        else:
-            self.horizon_1h_target = None
-            self.horizon_2h_target = None
 
         # FIXED: Calculate start index based on actual temporal coverage needed
         # For 15m lookback: need lookback_15m * 3 indices (since data is aligned to 5m)
@@ -176,9 +162,8 @@ class MultiTimeframeDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
         """
         Returns:
-            Tuple of (x_5m, x_15m, x_45m, direction_target, volatility_target, regime_target,
-                      horizon_1h_target, horizon_2h_target)
-            If targets not available, they default to 0.0 or NaN
+            Tuple of (x_5m, x_15m, x_45m, direction_target, volatility_target, regime_target)
+            If targets not available, they default to 0.0
         """
         actual_idx = self.valid_indices[idx]
 
@@ -219,14 +204,6 @@ class MultiTimeframeDataset(Dataset):
             vol_target = torch.tensor(0.0, dtype=torch.float32)
             regime_target = torch.tensor(0.0, dtype=torch.float32)
 
-        # Multi-horizon targets
-        if self.has_multi_horizon:
-            h1_target = torch.tensor(self.horizon_1h_target[actual_idx], dtype=torch.float32)
-            h2_target = torch.tensor(self.horizon_2h_target[actual_idx], dtype=torch.float32)
-        else:
-            h1_target = torch.tensor(float('nan'), dtype=torch.float32)
-            h2_target = torch.tensor(float('nan'), dtype=torch.float32)
-
         return (
             torch.tensor(x_5m, dtype=torch.float32),
             torch.tensor(x_15m, dtype=torch.float32),
@@ -234,183 +211,7 @@ class MultiTimeframeDataset(Dataset):
             y_tensor,
             vol_target,
             regime_target,
-            h1_target,
-            h2_target
         )
-
-
-class FocalLoss(nn.Module):
-    """
-    Focal Loss for multi-class classification.
-    
-    FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
-    
-    Key properties:
-    - Down-weights easy examples (high p_t) where model is already confident
-    - Focuses learning on hard examples (low p_t) that the model struggles with
-    - Perfect for class collapse where model ignores minority classes
-    
-    In our case: The model predicts Strong Up (34.7%) instead of Weak Up (3.8%)
-    because Strong Up is "easier". Focal loss penalizes these easy examples
-    and forces attention to the hard Weak Up distinctions.
-    
-    Reference: "Focal Loss for Dense Object Detection" (Lin et al., 2017)
-    """
-    
-    def __init__(
-        self, 
-        weight: Optional[torch.Tensor] = None,
-        gamma: float = 2.0,
-        reduction: str = 'mean',
-        label_smoothing: float = 0.1
-    ):
-        """
-        Args:
-            weight: Class weights tensor [num_classes]
-            gamma: Focusing parameter. Higher = more focus on hard examples.
-                   γ=0 is equivalent to CrossEntropyLoss
-                   γ=2 is typical for object detection
-            reduction: 'none', 'mean', or 'sum'
-            label_smoothing: Prevents overconfidence, helps generalization
-        """
-        super().__init__()
-        self.weight = weight
-        self.gamma = gamma
-        self.reduction = reduction
-        self.label_smoothing = label_smoothing
-        
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            logits: Raw model outputs [batch, num_classes]
-            targets: Class labels [batch]
-        
-        Returns:
-            Focal loss value
-        """
-        num_classes = logits.size(-1)
-        
-        # Apply label smoothing
-        # Converts hard labels to soft: [0,0,1,0,0] -> [0.02, 0.02, 0.92, 0.02, 0.02]
-        if self.label_smoothing > 0:
-            with torch.no_grad():
-                smooth_targets = torch.zeros_like(logits)
-                smooth_targets.fill_(self.label_smoothing / (num_classes - 1))
-                smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
-        
-        # Compute softmax probabilities
-        probs = torch.softmax(logits, dim=-1)
-        
-        # Get probability for true class: p_t
-        p_t = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-        
-        # Compute focal weight: (1 - p_t)^gamma
-        # When p_t is high (easy example), weight is low
-        # When p_t is low (hard example), weight is high
-        focal_weight = (1 - p_t) ** self.gamma
-        
-        # Compute cross-entropy (with or without label smoothing)
-        if self.label_smoothing > 0:
-            # Log softmax for numerical stability
-            log_probs = torch.log_softmax(logits, dim=-1)
-            ce_loss = -(smooth_targets * log_probs).sum(dim=-1)
-        else:
-            ce_loss = nn.functional.cross_entropy(
-                logits, targets, weight=self.weight, reduction='none'
-            )
-        
-        # Apply focal weight
-        focal_loss = focal_weight * ce_loss
-        
-        # Apply class weights if provided (for label smoothing path)
-        if self.weight is not None and self.label_smoothing > 0:
-            class_weight = self.weight[targets]
-            focal_loss = focal_loss * class_weight
-        
-        # Reduce
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        return focal_loss
-
-
-class BinaryFocalLoss(nn.Module):
-    """
-    Focal Loss for binary classification.
-
-    FL(p_t) = -α * (1 - p_t)^γ * log(p_t)
-
-    Key properties:
-    - Prevents prediction collapse where model predicts one class dominantly
-    - Down-weights easy examples where model is already confident
-    - Forces the model to learn hard examples at the decision boundary
-
-    In our case: Model was predicting Down 74% of time (collapse). Focal loss
-    down-weights these easy predictions and focuses on the hard Up/Down boundary.
-    """
-
-    def __init__(
-        self,
-        alpha: float = 0.25,
-        gamma: float = 2.0,
-        label_smoothing: float = 0.1,
-        pos_weight: Optional[torch.Tensor] = None
-    ):
-        """
-        Args:
-            alpha: Balance factor for positive class (0.25 = focus on minority)
-            gamma: Focusing parameter. γ=2 is typical.
-            label_smoothing: Smooth labels [0,1] -> [0.05, 0.95]
-            pos_weight: Optional weight for positive class (handles imbalance)
-        """
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.label_smoothing = label_smoothing
-        self.pos_weight = pos_weight
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            logits: Raw model outputs [batch] or [batch, 1]
-            targets: Binary labels [batch] (0 or 1)
-
-        Returns:
-            Focal loss value (scalar)
-        """
-        # Flatten logits if needed
-        logits = logits.view(-1)
-        targets = targets.view(-1).float()
-
-        # Apply label smoothing: [0, 1] -> [eps, 1-eps]
-        if self.label_smoothing > 0:
-            targets = targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
-
-        # Compute probabilities
-        probs = torch.sigmoid(logits)
-
-        # p_t is probability of correct class
-        # For target=1: p_t = probs
-        # For target=0: p_t = 1 - probs
-        p_t = probs * targets + (1 - probs) * (1 - targets)
-
-        # Focal weight: (1 - p_t)^gamma
-        focal_weight = (1 - p_t) ** self.gamma
-
-        # Alpha weight: alpha for positive, (1-alpha) for negative
-        alpha_weight = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-
-        # BCE loss (element-wise) - use pos_weight if provided for class balancing
-        bce_loss = nn.functional.binary_cross_entropy_with_logits(
-            logits, targets, reduction='none',
-            pos_weight=self.pos_weight  # Handles class imbalance if provided
-        )
-
-        # Apply focal and alpha weights
-        focal_loss = alpha_weight * focal_weight * bce_loss
-
-        return focal_loss.mean()
 
 
 class BalancedBCELoss(nn.Module):
@@ -503,88 +304,6 @@ class BalancedBCELoss(nn.Module):
         return total_loss
 
 
-class RankingMSELoss(nn.Module):
-    """
-    Loss that prevents mode collapse using RANKING + NOISE INJECTION.
-    
-    WHY ALL PREVIOUS LOSSES FAILED:
-    MSE with noisy targets INHERENTLY encourages constant predictions!
-    The optimal MSE prediction for noisy data is the conditional mean.
-    If features aren't predictive, optimal = unconditional mean (constant).
-    
-    SOLUTION: Two-pronged attack:
-    
-    1. NOISE INJECTION: Add Gaussian noise to predictions during training.
-       This breaks symmetry and forces the model to explore output space.
-       The noise is scaled to match target std, so the model MUST learn
-       to output values in the correct range to minimize loss.
-    
-    2. RANKING LOSS: Instead of just matching values, reward correct ORDERING.
-       If target_i > target_j, then pred_i should be > pred_j.
-       This has gradient even when predictions are constant!
-       
-       margin_loss = max(0, margin - (pred_i - pred_j)) when target_i > target_j
-       
-       At collapse (pred_i = pred_j), gradient = -1 (pushes pred_i UP, pred_j DOWN)
-    """
-    
-    def __init__(self, ranking_weight: float = 2.0):
-        """
-        Args:
-            ranking_weight: Weight for ranking loss component
-        """
-        super().__init__()
-        self.ranking_weight = ranking_weight
-        
-    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        predictions = predictions.squeeze()
-        targets = targets.squeeze()
-        batch_size = predictions.size(0)
-        
-        # 1. Raw MSE - learns magnitude
-        mse_loss = nn.functional.mse_loss(predictions, targets)
-        
-        # 2. RANKING LOSS - learns relative ordering
-        # Pairwise ranking loss
-        ranking_loss = torch.tensor(0.0, device=predictions.device)
-        if batch_size > 1:
-            # Sample random pairs (efficient implementation)
-            # Compare i with i+1 (cyclic)
-            idx1 = torch.arange(batch_size, device=predictions.device)
-            idx2 = (idx1 + 1) % batch_size
-            
-            target_diff = targets[idx1] - targets[idx2]
-            pred_diff = predictions[idx1] - predictions[idx2]
-            
-            # Only penalize if signs don't match direction
-            # If target_diff > 0, we want pred_diff > 0
-            # Loss = ReLU(-sign(target_diff) * pred_diff)
-            signs = torch.sign(target_diff)
-            # Ignore small differences to reduce noise
-            mask = (torch.abs(target_diff) > 0.0001).float()
-            
-            ranking_loss = (torch.nn.functional.relu(-signs * pred_diff) * mask).mean()
-        
-        # 3. VARIANCE LOSS - Force scale matching (Robust)
-        pred_std = predictions.std() + 1e-6
-        target_std = targets.std().detach() + 1e-6
-        variance_loss = (pred_std - target_std) ** 2
-
-        # 4. MEAN LOSS - Force centering (Anti-bias)
-        pred_mean = predictions.mean()
-        target_mean = targets.mean().detach()
-        mean_loss = (pred_mean - target_mean) ** 2
-        
-        # Combined loss
-        # Variance and Mean losses are critical for avoiding collapse
-        total_loss = mse_loss + \
-                     self.ranking_weight * ranking_loss + \
-                     10.0 * variance_loss + \
-                     10.0 * mean_loss
-        
-        return total_loss
-
-
 def compute_class_weights(
     labels: np.ndarray,
     num_classes: int,
@@ -650,8 +369,6 @@ class AnalystTrainer:
         aux_volatility_weight: float = 0.3,
         aux_regime_weight: float = 0.2,
         gradient_accumulation_steps: int = 1,
-        use_multi_horizon: bool = False,
-        horizon_weights: Optional[Dict[str, float]] = None,
         input_noise_std: float = 0.0
     ):
         """
@@ -674,8 +391,6 @@ class AnalystTrainer:
             aux_volatility_weight: Weight for volatility prediction loss (MSE)
             aux_regime_weight: Weight for regime classification loss (BCE)
             gradient_accumulation_steps: Accumulate gradients over N batches for smoother updates
-            use_multi_horizon: Whether to use multi-horizon prediction (1H, 2H, 4H)
-            horizon_weights: Dict mapping horizon names to loss weights (e.g., {'1h': 0.2, '2h': 0.3, '4h': 1.0})
             input_noise_std: Std dev of Gaussian noise added to inputs during training only.
         """
         self.model = model.to(device)
@@ -779,16 +494,13 @@ class AnalystTrainer:
             self.is_binary = True
             logger.info("Using BalancedBCELoss for binary classification (5x diversity penalty)")
         else:
-            # Multi-class: FocalLoss to address class oscillation
-            # - gamma=2.0: Down-weights easy examples, focuses on hard Up/Down distinctions
-            # - label_smoothing=0.1: Softens noisy boundaries in financial data
-            self.criterion = FocalLoss(
+            # Multi-class: CrossEntropyLoss with class weights and label smoothing
+            self.criterion = nn.CrossEntropyLoss(
                 weight=class_weights,
-                gamma=2.0,
                 label_smoothing=0.1
             )
             self.is_binary = False
-            logger.info(f"Using FocalLoss for {num_classes}-class classification")
+            logger.info(f"Using CrossEntropyLoss for {num_classes}-class classification")
 
         # Auxiliary losses for multi-task learning (regularization)
         self.use_aux = use_auxiliary_losses
@@ -801,15 +513,6 @@ class AnalystTrainer:
             # Regime classification: CrossEntropy loss (3-class: Trend, Chop, Volatile)
             self.aux_regime_criterion = nn.CrossEntropyLoss()
             logger.info(f"Using auxiliary losses: vol_weight={aux_volatility_weight}, regime_weight={aux_regime_weight}")
-
-        # Multi-horizon losses (addresses Target Mismatch)
-        self.use_multi_horizon = use_multi_horizon
-        self.horizon_weights = horizon_weights or {'1h': 0.2, '2h': 0.3, '4h': 1.0}
-
-        if self.use_multi_horizon:
-            # Multi-horizon uses BCE for binary direction at each horizon
-            self.multi_horizon_criterion = nn.BCEWithLogitsLoss()
-            logger.info(f"Using multi-horizon prediction: weights={self.horizon_weights}")
 
         # Training history
         self.train_losses = []
@@ -845,7 +548,7 @@ class AnalystTrainer:
             Tuple of (avg_loss, accuracy, direction_accuracy, macro_f1)
         """
         self.model.train()
-        # Enable noise injection for FocalLoss (not needed for BCEWithLogitsLoss)
+        # Enable train mode on criterion if applicable
         if hasattr(self.criterion, 'train') and not self.is_binary:
             self.criterion.train()
         total_loss = 0.0
@@ -870,8 +573,7 @@ class AnalystTrainer:
             batch_start = time.time()
 
             # Unpack batch data
-            # (x_15m, x_1h, x_4h, targets, vol_targets, regime_targets, h1_targets, h2_targets)
-            x_15m, x_1h, x_4h, targets, vol_targets, regime_targets, h1_targets, h2_targets = batch_data
+            x_15m, x_1h, x_4h, targets, vol_targets, regime_targets = batch_data
 
             # Move to device
             x_15m = x_15m.to(self.device)
@@ -887,38 +589,16 @@ class AnalystTrainer:
             
             model_kwargs: dict = {}
 
-            # Forward pass with optional auxiliary and multi-horizon outputs
-            if self.use_aux and self.use_multi_horizon:
-                vol_targets = vol_targets.to(self.device)
-                regime_targets = regime_targets.to(self.device)
-                h1_targets = h1_targets.to(self.device)
-                h2_targets = h2_targets.to(self.device)
-                outputs = self.model(
-                    x_15m, x_1h, x_4h,
-                    return_aux=True,
-                    return_multi_horizon=True
-                )
-                # Outputs: (context, direction, volatility, regime, horizon_1h, horizon_2h)
-                _, logits, vol_pred, regime_pred, h1_logits, h2_logits = outputs
-            elif self.use_aux:
+            # Forward pass with optional auxiliary outputs
+            if self.use_aux:
                 vol_targets = vol_targets.to(self.device)
                 regime_targets = regime_targets.to(self.device)
                 _, logits, vol_pred, regime_pred = self.model(
                     x_15m, x_1h, x_4h,
                     return_aux=True
                 )
-                h1_logits, h2_logits = None, None
-            elif self.use_multi_horizon:
-                h1_targets = h1_targets.to(self.device)
-                h2_targets = h2_targets.to(self.device)
-                _, logits, h1_logits, h2_logits = self.model(
-                    x_15m, x_1h, x_4h,
-                    return_multi_horizon=True
-                )
-                vol_pred, regime_pred = None, None
             else:
                 _, logits = self.model(x_15m, x_1h, x_4h, **model_kwargs)
-                h1_logits, h2_logits, vol_pred, regime_pred = None, None, None, None
 
             # Compute main direction loss (4H horizon - primary target)
             if self.is_binary:
@@ -927,32 +607,13 @@ class AnalystTrainer:
             else:
                 direction_loss = self.criterion(logits, targets.long())
 
-            # Total loss = direction (4H) + weighted auxiliary + weighted multi-horizon
-            loss = direction_loss * self.horizon_weights.get('4h', 1.0)
+            # Total loss = direction + weighted auxiliary
+            loss = direction_loss
 
-            if self.use_aux and vol_pred is not None:
+            if self.use_aux:
                 vol_loss = self.aux_vol_criterion(vol_pred, vol_targets)
                 regime_loss = self.aux_regime_criterion(regime_pred, regime_targets)
                 loss = loss + self.aux_vol_weight * vol_loss + self.aux_regime_weight * regime_loss
-
-            if self.use_multi_horizon and h1_logits is not None:
-                # Compute multi-horizon losses (only on valid targets, not NaN)
-                h1_valid = ~torch.isnan(h1_targets)
-                h2_valid = ~torch.isnan(h2_targets)
-
-                if h1_valid.any():
-                    h1_loss = self.multi_horizon_criterion(
-                        h1_logits.squeeze(-1)[h1_valid],
-                        h1_targets[h1_valid]
-                    )
-                    loss = loss + self.horizon_weights.get('1h', 0.2) * h1_loss
-
-                if h2_valid.any():
-                    h2_loss = self.multi_horizon_criterion(
-                        h2_logits.squeeze(-1)[h2_valid],
-                        h2_targets[h2_valid]
-                    )
-                    loss = loss + self.horizon_weights.get('2h', 0.3) * h2_loss
 
             # Normalize loss by accumulation steps for gradient accumulation
             if accum_steps > 1:
@@ -1058,7 +719,7 @@ class AnalystTrainer:
 
         for batch_data in val_loader:
             # Unpack batch data
-            x_15m, x_1h, x_4h, targets, vol_targets, regime_targets, h1_targets, h2_targets = batch_data
+            x_15m, x_1h, x_4h, targets, vol_targets, regime_targets = batch_data
 
             x_15m = x_15m.to(self.device)
             x_1h = x_1h.to(self.device)
@@ -1355,7 +1016,7 @@ class AnalystTrainer:
                 break
 
             # Unpack batch tuple
-            x_15m, x_1h, x_4h, tgt, _, _, _, _ = batch_data
+            x_15m, x_1h, x_4h, tgt, _, _ = batch_data
 
             x_15m = x_15m.to(self.device)
             x_1h = x_1h.to(self.device)
@@ -1762,28 +1423,6 @@ def train_analyst(
         logger.info(f"  Volatility target: mean={volatility_target.mean():.3f}, std={volatility_target.std():.3f}")
         logger.info(f"  Regime target: {regime_target.mean()*100:.1f}% trending")
 
-    # Create multi-horizon targets if enabled (addresses Target Mismatch)
-    use_multi_horizon = getattr(config, 'use_multi_horizon', False)
-    horizon_1h_target = None
-    horizon_2h_target = None
-    if use_multi_horizon and use_binary:
-        logger.info("Creating multi-horizon targets (1H, 2H, 4H)...")
-        min_move_atr = getattr(config, 'min_move_atr_threshold', 0.3)
-
-        labels_dict, _, meta_dict = create_multi_horizon_targets(
-            df_5m,
-            horizons={'1h': 4, '2h': 8, '4h': future_window},
-            smooth_window=max(2, smooth_window // 2),
-            min_move_atr=min_move_atr
-        )
-
-        # Extract 1H and 2H targets (4H is the primary target, already created)
-        horizon_1h_target = labels_dict['1h']
-        horizon_2h_target = labels_dict['2h']
-
-        logger.info(f"  1H target: {meta_dict['1h']['n_down']} Down, {meta_dict['1h']['n_up']} Up")
-        logger.info(f"  2H target: {meta_dict['2h']['n_down']} Down, {meta_dict['2h']['n_up']} Up")
-
     # Add Market Sessions
     logger.info("Adding market session features...")
     df_5m = add_market_sessions(df_5m)
@@ -1818,8 +1457,6 @@ def train_analyst(
         volatility_target=volatility_target,  # Auxiliary target
         regime_target=regime_target,  # Auxiliary target
         is_binary=use_binary,  # Affects target tensor dtype
-        horizon_1h_target=horizon_1h_target,  # Multi-horizon target (1H)
-        horizon_2h_target=horizon_2h_target,  # Multi-horizon target (2H)
     )
 
     # Split into train/validation using CHRONOLOGICAL split (NOT random!)
@@ -1928,9 +1565,6 @@ def train_analyst(
     aux_regime_weight = getattr(config, 'aux_regime_weight', 0.2)
     grad_accum_steps = getattr(config, 'gradient_accumulation_steps', 1)
 
-    # Get multi-horizon settings from config
-    horizon_weights = getattr(config, 'multi_horizon_weights', {'1h': 0.2, '2h': 0.3, '4h': 1.0})
-
     trainer = AnalystTrainer(
         model=model,
         device=device,
@@ -1949,8 +1583,6 @@ def train_analyst(
         aux_volatility_weight=aux_vol_weight,
         aux_regime_weight=aux_regime_weight,
         gradient_accumulation_steps=grad_accum_steps,
-        use_multi_horizon=use_multi_horizon,
-        horizon_weights=horizon_weights,
         input_noise_std=getattr(config, 'input_noise_std', 0.0)
     )
 

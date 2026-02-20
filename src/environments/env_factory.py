@@ -133,8 +133,6 @@ def prepare_env_kwargs_for_vectorization(
     config: Any,
     market_feat_mean: Optional[np.ndarray],
     market_feat_std: Optional[np.ndarray],
-    regime_labels: Optional[np.ndarray],
-    use_regime_sampling: bool,
     precomputed_analyst_cache: Optional[Dict[str, np.ndarray]],
     ohlc_data: Optional[np.ndarray],
     timestamps: Optional[np.ndarray],
@@ -157,8 +155,6 @@ def prepare_env_kwargs_for_vectorization(
         config: Configuration object (values extracted, object not pickled)
         market_feat_mean: Mean for market feature normalization
         market_feat_std: Std for market feature normalization
-        regime_labels: Regime labels for balanced sampling
-        use_regime_sampling: Whether to use regime-balanced episode starts
         precomputed_analyst_cache: Pre-computed analyst outputs (contexts, probs)
         ohlc_data: OHLC data for visualization
         timestamps: Timestamps for visualization
@@ -172,23 +168,21 @@ def prepare_env_kwargs_for_vectorization(
     trading_cfg = getattr(config, 'trading', config) if config else None
 
     # Default values matching config/settings.py TradingConfig
-    spread_pips = 10.0              # config.trading.spread_pips
+    # CRITICAL: These must stay in sync with config/settings.py defaults!
+    spread_pips = 50.0              # config.trading.spread_pips
     slippage_pips = 0.0             # config.trading.slippage_pips
-    fomo_penalty = 0.0
-    chop_penalty = 0.0
     fomo_threshold_atr = 4.0        # config.trading.fomo_threshold_atr
     fomo_lookback_bars = 24         # config.trading.fomo_lookback_bars
     chop_threshold = 80.0           # config.trading.chop_threshold
     max_steps = 500
     reward_scaling = 0.01           # config.trading.reward_scaling
     context_dim = 32                # config.analyst.context_dim
-    trade_entry_bonus = 0.1         # config.trading.trade_entry_bonus
-    holding_bonus = 0.0             # config.trading.holding_bonus (DEPRECATED)
-    noise_level = 0.05
+    trade_entry_bonus = 0.0         # config.trading.trade_entry_bonus
+    noise_level = 0.0
     profit_scaling = 0.01           # config.trading.profit_scaling
     loss_scaling = 0.01             # config.trading.loss_scaling
     use_alpha_reward = True         # config.trading.use_alpha_reward
-    alpha_baseline_exposure = 0.7   # config.trading.alpha_baseline_exposure
+    alpha_baseline_exposure = 0.0   # config.trading.alpha_baseline_exposure
     sl_atr_multiplier = 2.0         # config.trading.sl_atr_multiplier
     tp_atr_multiplier = 6.0         # config.trading.tp_atr_multiplier
     use_stop_loss = True            # config.trading.use_stop_loss
@@ -196,13 +190,10 @@ def prepare_env_kwargs_for_vectorization(
     volatility_sizing = True
     risk_per_trade = 100.0          # config.trading.risk_per_trade
     num_classes = 2
-    enforce_analyst_alignment = False  # config.trading.enforce_analyst_alignment
-    use_sparse_rewards = False      # config.trading.use_sparse_rewards (DEPRECATED)
-    loss_tolerance_atr = 1.0        # config.trading.loss_tolerance_atr
     min_hold_bars = 0               # config.trading.min_hold_bars
     early_exit_profit_atr = 0.0     # config.trading.early_exit_profit_atr
     break_even_atr = 2.0            # config.trading.break_even_atr
-    opportunity_cost_multiplier = 0.0  # config.trading.opportunity_cost_multiplier
+    opportunity_cost_multiplier = 0.2  # config.trading.opportunity_cost_multiplier
     opportunity_cost_cap = 0.2      # config.trading.opportunity_cost_cap
     rolling_norm_min_samples = 1
     agent_lookback_window = 6
@@ -211,8 +202,6 @@ def prepare_env_kwargs_for_vectorization(
     if trading_cfg is not None:
         spread_pips = getattr(trading_cfg, 'spread_pips', spread_pips)
         slippage_pips = getattr(trading_cfg, 'slippage_pips', slippage_pips)
-        fomo_penalty = getattr(trading_cfg, 'fomo_penalty', fomo_penalty)
-        chop_penalty = getattr(trading_cfg, 'chop_penalty', chop_penalty)
         fomo_threshold_atr = getattr(trading_cfg, 'fomo_threshold_atr', fomo_threshold_atr)
         fomo_lookback_bars = getattr(trading_cfg, 'fomo_lookback_bars', fomo_lookback_bars)
         chop_threshold = getattr(trading_cfg, 'chop_threshold', chop_threshold)
@@ -222,16 +211,12 @@ def prepare_env_kwargs_for_vectorization(
         tp_atr_multiplier = getattr(trading_cfg, 'tp_atr_multiplier', tp_atr_multiplier)
         use_stop_loss = getattr(trading_cfg, 'use_stop_loss', use_stop_loss)
         use_take_profit = getattr(trading_cfg, 'use_take_profit', use_take_profit)
-        enforce_analyst_alignment = getattr(trading_cfg, 'enforce_analyst_alignment', enforce_analyst_alignment)
         trade_entry_bonus = getattr(trading_cfg, 'trade_entry_bonus', trade_entry_bonus)
-        holding_bonus = getattr(trading_cfg, 'holding_bonus', holding_bonus)
         noise_level = getattr(trading_cfg, 'noise_level', noise_level)
         profit_scaling = getattr(trading_cfg, 'profit_scaling', profit_scaling)
         loss_scaling = getattr(trading_cfg, 'loss_scaling', loss_scaling)
         use_alpha_reward = getattr(trading_cfg, 'use_alpha_reward', use_alpha_reward)
         alpha_baseline_exposure = getattr(trading_cfg, 'alpha_baseline_exposure', alpha_baseline_exposure)
-        use_sparse_rewards = getattr(trading_cfg, 'use_sparse_rewards', use_sparse_rewards)
-        loss_tolerance_atr = getattr(trading_cfg, 'loss_tolerance_atr', loss_tolerance_atr)
         min_hold_bars = getattr(trading_cfg, 'min_hold_bars', min_hold_bars)
         early_exit_profit_atr = getattr(trading_cfg, 'early_exit_profit_atr', early_exit_profit_atr)
         break_even_atr = getattr(trading_cfg, 'break_even_atr', break_even_atr)
@@ -258,15 +243,12 @@ def prepare_env_kwargs_for_vectorization(
         'context_dim': context_dim,
         'spread_pips': spread_pips,
         'slippage_pips': slippage_pips,
-        'fomo_penalty': fomo_penalty,
-        'chop_penalty': chop_penalty,
         'fomo_threshold_atr': fomo_threshold_atr,
         'fomo_lookback_bars': fomo_lookback_bars,
         'chop_threshold': chop_threshold,
         'max_steps': max_steps,
         'reward_scaling': reward_scaling,
         'trade_entry_bonus': trade_entry_bonus,
-        'holding_bonus': holding_bonus,
         'profit_scaling': profit_scaling,
         'loss_scaling': loss_scaling,
         'use_alpha_reward': use_alpha_reward,
@@ -278,14 +260,9 @@ def prepare_env_kwargs_for_vectorization(
         'tp_atr_multiplier': tp_atr_multiplier,
         'use_stop_loss': use_stop_loss,
         'use_take_profit': use_take_profit,
-        'regime_labels': regime_labels,
-        'use_regime_sampling': use_regime_sampling,
         'volatility_sizing': volatility_sizing,
         'risk_per_trade': risk_per_trade,
         'num_classes': num_classes,
-        'enforce_analyst_alignment': enforce_analyst_alignment,
-        'use_sparse_rewards': use_sparse_rewards,
-        'loss_tolerance_atr': loss_tolerance_atr,
         'min_hold_bars': min_hold_bars,
         'early_exit_profit_atr': early_exit_profit_atr,
         'break_even_atr': break_even_atr,

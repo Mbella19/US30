@@ -386,9 +386,9 @@ class TestEpisodeBoundaries:
         
         # Open a position
         env.reset()
-        env.step(np.array([1.0, 0], dtype=np.float32))
-        
-        assert env.position != 0 or True  # May or may not open on first step
+        env.step(np.array([1, 0], dtype=np.int64))
+
+        # Position may or may not open on first step (depends on volatility sizing)
         
         # Reset should clear
         env.reset()

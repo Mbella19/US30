@@ -172,8 +172,6 @@ def finetune_agent():
     config.agent.learning_rate = args.lr
     config.agent.ent_coef = args.ent_coef
     # Finetuning: keep mostly PnL rewards with light shaping penalties only.
-    config.trading.fomo_penalty = 0.0
-    config.trading.chop_penalty = 0.0
     # Small opportunity cost penalty to discourage staying flat/wrong-direction.
     config.trading.opportunity_cost_multiplier = 0.1
     config.trading.opportunity_cost_cap = 0.02
@@ -182,10 +180,7 @@ def finetune_agent():
     config.trading.underwater_threshold_atr = 1.0
     # Lower per-trade risk for finetuning.
     config.trading.risk_per_trade = 50.0
-    config.trading.early_exit_penalty = 0.0
     config.trading.trade_entry_bonus = 0.0
-    config.trading.holding_bonus = 0.0
-    config.trading.use_sparse_rewards = False
     config.trading.use_alpha_reward = False
     config.trading.profit_scaling = config.trading.reward_scaling
     config.trading.loss_scaling = config.trading.reward_scaling
@@ -231,7 +226,6 @@ def finetune_agent():
         add_market_sessions,
         detect_fractals,
         detect_structure_breaks,
-        compute_regime_labels,
     )
 
     logger.info("Adding augmented features (sessions & structure)...")
@@ -333,30 +327,7 @@ def finetune_agent():
     logger.info(f"  Mean: {market_feat_mean}")
     logger.info(f"  Std:  {market_feat_std}")
 
-    # Regime-balanced sampling (training data only)
     max_steps_per_episode = getattr(config.trading, "max_steps_per_episode", 500)
-    use_regime_sampling_train = getattr(config.trading, "use_regime_sampling", True)
-    train_regime_labels = None
-    if use_regime_sampling_train:
-        logger.info(
-            "Computing regime labels for balanced sampling "
-            f"(forward_window={max_steps_per_episode} bars)..."
-        )
-        env_df_5m = df_5m.iloc[start_idx:start_idx + n_samples]
-        train_regime_labels = compute_regime_labels(
-            env_df_5m.iloc[train_start_idx:train_end_idx],
-            lookback=20,
-            forward_window=max_steps_per_episode,
-        )
-        regime_counts = {
-            'Bullish': (train_regime_labels == 0).sum(),
-            'Ranging': (train_regime_labels == 1).sum(),
-            'Bearish': (train_regime_labels == 2).sum()
-        }
-        logger.info(f"Regime distribution: {regime_counts}")
-        logger.info("Regime sampling ENABLED: Agent will see 33% Bullish, 33% Ranging, 33% Bearish")
-    else:
-        logger.info("Regime sampling DISABLED: Using random episode starts")
 
     # 6. Load Analyst Cache (if available)
     analyst_cache_path = data_processed_path / 'analyst_cache.npz'
@@ -405,8 +376,6 @@ def finetune_agent():
             config=config,
             market_feat_mean=market_feat_mean,
             market_feat_std=market_feat_std,
-            regime_labels=train_regime_labels,
-            use_regime_sampling=use_regime_sampling_train,
             precomputed_analyst_cache=train_analyst_cache,
             ohlc_data=train_ohlc,
             timestamps=train_timestamps,
@@ -440,8 +409,6 @@ def finetune_agent():
             device=device,
             market_feat_mean=market_feat_mean,
             market_feat_std=market_feat_std,
-            regime_labels=train_regime_labels,
-            use_regime_sampling=use_regime_sampling_train,
             precomputed_analyst_cache=train_analyst_cache,
             ohlc_data=train_ohlc,
             timestamps=train_timestamps,

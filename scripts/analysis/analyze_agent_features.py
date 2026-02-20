@@ -41,7 +41,7 @@ from src.live.bridge_constants import MARKET_FEATURE_COLS
 # Constants
 # ============================================================================
 
-N_MARKET_FEATURES = len(MARKET_FEATURE_COLS)  # 41
+N_MARKET_FEATURES = len(MARKET_FEATURE_COLS)  # 36
 
 # Observation vector layout (use_analyst=False, 145 dims)
 OBS_BLOCKS = {
@@ -225,7 +225,6 @@ def build_analysis_env(processed_dir: Path, config):
         market_feat_mean=mkt_mean,
         market_feat_std=mkt_std,
         use_analyst=False,
-        use_regime_sampling=False,
         ohlc_data=ohlc[train_end:val_end] if ohlc is not None else None,
         rolling_lookback_data=rolling_warmup,
     )

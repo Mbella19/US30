@@ -65,7 +65,7 @@ Two-stage hybrid trading system for US30 (Dow Jones CFD):
 | `src/models/tcn_analyst.py` | TCN analyst architecture (default) |
 | `src/models/analyst.py` | Transformer analyst (experimental) |
 | `src/live/mt5_bridge.py` | TCP server + observation construction for live trading |
-| `src/live/bridge_constants.py` | MODEL_FEATURE_COLS (30) and MARKET_FEATURE_COLS (33) |
+| `src/live/bridge_constants.py` | MODEL_FEATURE_COLS (33) and MARKET_FEATURE_COLS (36) |
 | `src/data/features.py` | Feature engineering (patterns, indicators, structure, mean reversion) |
 | `src/data/normalizer.py` | FeatureNormalizer (Z-score) class |
 | `src/evaluation/metrics.py` | Primary metrics (backtest/pipeline) |
@@ -87,32 +87,32 @@ Two-layer normalization that MUST match between training and live bridge:
 
 Constructed in `TradingEnv._get_observation()` and `mt5_bridge._build_observation()`.
 
-**With `use_analyst=False` (121 dims, current config):**
+**With `use_analyst=False` (130 dims, current config):**
 
 | Component | Dims | Index Range |
 |-----------|------|-------------|
 | Position | 4 | 0-3 |
-| Market 5m | 33 | 4-36 |
-| Market 15m | 33 | 37-69 |
-| Market 45m | 33 | 70-102 |
-| SL/TP | 2 | 103-104 |
-| Hold Features | 4 | 105-108 |
-| Returns | 12 | 109-120 |
+| Market 5m | 36 | 4-39 |
+| Market 15m | 36 | 40-75 |
+| Market 45m | 36 | 76-111 |
+| SL/TP | 2 | 112-113 |
+| Hold Features | 4 | 114-117 |
+| Returns | 12 | 118-129 |
 
 - **position_state**: [position, entry_price_norm, unrealized_pnl_norm, time_in_trade] — normalized by ATR
-- **market_feat_norm**: 33 features × 3 timeframes = 99 dims (20 base + 4 percentile + 4 OOD + 5 mean reversion), rolling-normalized
+- **market_feat_norm**: 36 features × 3 timeframes = 108 dims (23 base + 4 percentile + 4 OOD + 5 mean reversion), rolling-normalized
 - **sl_tp**: [dist_sl_norm, dist_tp_norm] — normalized by ATR
 - **hold_features**: [profit_progress, dist_to_tp_pct, momentum_aligned, session_progress]
 - **returns_window**: Last 12 bars of 5m log-returns (from FeatureNorm'd data)
 
-With `use_analyst=True`: prepend context(32), insert analyst_metrics(5) after market → 155 dims.
+With `use_analyst=True`: prepend context(32), insert analyst_metrics(5) after market → 167 dims.
 
 ## Instrument-Specific Configuration
 
 - **Symbol**: US30 (Dow Jones CFD)
 - **pip_value**: 1.0 (1 point = 1.0 price movement)
 - **lot_size**: 1.0 ($1 per point per lot)
-- **spread_pips**: 10.0
+- **spread_pips**: 50.0 (worst-case robustness training)
 - **min_body_points**: 5.0, **min_range_points**: 10.0
 - **Data file**: `new us30_UTC.csv` (env var `US30_DATA_DIR`)
 - **Date splits**: train to 2025-10-31, validation/OOS to 2025-12-30

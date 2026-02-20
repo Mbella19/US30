@@ -30,7 +30,7 @@ from stable_baselines3.common.monitor import Monitor
 
 import gymnasium as gym
 
-from src.utils.callbacks import linear_schedule, MemoryCleanupCallback
+from src.utils.callbacks import MemoryCleanupCallback
 
 
 class EntropyScheduleCallback(BaseCallback):
@@ -172,7 +172,6 @@ class SniperAgent:
         device: Optional[str | torch.device] = None,
         verbose: int = 1,
         seed: Optional[int] = None,
-        use_lr_schedule: bool = False,  # v26: DISABLED - constant LR for aggressive learning
         tensorboard_log: Optional[str] = None,
     ):
         """
@@ -226,16 +225,12 @@ class SniperAgent:
                 device = "cpu"
 
         # Create PPO model
-        # Apply learning rate schedule if enabled
-        lr_value = linear_schedule(learning_rate) if use_lr_schedule else learning_rate
-        if use_lr_schedule and verbose > 0:
-            logger.debug(f"Using linear LR schedule: {learning_rate:.2e} -> {learning_rate * 0.05:.2e}")
         
         try:
             self.model = PPO(
                 policy="MlpPolicy",
                 env=env,
-                learning_rate=lr_value,
+                learning_rate=learning_rate,
                 n_steps=n_steps,
                 batch_size=batch_size,
                 n_epochs=n_epochs,
@@ -262,7 +257,7 @@ class SniperAgent:
                 self.model = PPO(
                     policy="MlpPolicy",
                     env=env,
-                    learning_rate=lr_value,  # Use scheduled LR, not raw value
+                    learning_rate=learning_rate,  # Use scheduled LR, not raw value
                     n_steps=n_steps,
                     batch_size=batch_size,
                     n_epochs=n_epochs,
@@ -622,46 +617,3 @@ def create_agent(
     )
 
 
-def create_agent_with_config(
-    env: gym.Env,
-    config: Optional[object] = None,
-    device: Optional[str | torch.device] = None,
-    tensorboard_log: Optional[str] = None,
-) -> 'SniperAgent | RecurrentSniperAgent':
-    """
-    Factory function to create either SniperAgent or RecurrentSniperAgent.
-
-    This is the primary factory function for agent creation. It selects between
-    standard PPO (SniperAgent) and RecurrentPPO (RecurrentSniperAgent) based on
-    the config.recurrent_agent.use_recurrent flag.
-
-    Args:
-        env: Trading environment
-        config: Full Config object (with agent and recurrent_agent sub-configs)
-        device: Device for training
-        tensorboard_log: Directory for TensorBoard logs
-
-    Returns:
-        SniperAgent or RecurrentSniperAgent based on config
-    """
-    if config is None:
-        return SniperAgent(env, device=device, tensorboard_log=tensorboard_log)
-
-    # Check if recurrent mode is enabled
-    recurrent_cfg = getattr(config, 'recurrent_agent', None)
-    use_recurrent = recurrent_cfg.use_recurrent if recurrent_cfg else False
-
-    if use_recurrent:
-        # Import here to avoid circular imports and only when needed
-        from .recurrent_agent import create_recurrent_agent
-
-        logger.info("[Agent Factory] Creating RecurrentSniperAgent (LSTM-based) - EXPERIMENTAL")
-        return create_recurrent_agent(
-            env=env,
-            agent_config=config.agent,
-            recurrent_config=config.recurrent_agent,
-            device=device
-        )
-    else:
-        logger.info("[Agent Factory] Creating SniperAgent (standard PPO)")
-        return create_agent(env, config.agent, device=device, tensorboard_log=tensorboard_log)

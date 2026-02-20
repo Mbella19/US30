@@ -119,8 +119,8 @@ class Backtester:
 
         # OOD position sizing (parity with TradingEnv v37)
         self.market_features = market_features
-        self.ood_size_reduction_factor = ood_size_reduction_factor if ood_size_reduction_factor is not None else default_config.normalization.ood_size_reduction_factor
-        self.min_position_size_ratio = min_position_size_ratio if min_position_size_ratio is not None else default_config.normalization.min_position_size_ratio
+        self.ood_size_reduction_factor = ood_size_reduction_factor if ood_size_reduction_factor is not None else default_config.ood.ood_size_reduction_factor
+        self.min_position_size_ratio = min_position_size_ratio if min_position_size_ratio is not None else default_config.ood.min_position_size_ratio
 
         # State
         self.balance = self.initial_balance
@@ -617,18 +617,11 @@ def run_backtest(
     original_max_steps = env.max_steps
     env.max_steps = max_steps
 
-    # Detect if this is a recurrent agent (has LSTM states)
-    is_recurrent = hasattr(agent, 'reset_lstm_states')
-    if is_recurrent:
-        agent.reset_lstm_states()
-        logger.info("Using RecurrentPPO agent - LSTM states initialized")
-
     # Reset with FIXED start_idx to ensure full test coverage (not random!)
     obs, info = env.reset(options={'start_idx': start_idx})
     done = False
     truncated = False
     step = 0
-    episode_start = True  # Track episode start for recurrent agents
     equity_timestamps: List[int] = []
 
     env_timestamps = getattr(env, 'timestamps', None)
@@ -652,22 +645,11 @@ def run_backtest(
 
     while not done and not truncated:
         # Get action from agent
-        if is_recurrent:
-            # RecurrentPPO needs episode_start flag for LSTM state management
-            action, _ = agent.predict(
-                obs,
-                deterministic=deterministic,
-                episode_start=episode_start,
-                min_action_confidence=min_action_confidence
-            )
-            episode_start = False  # Only first step is episode start
-        else:
-            # Standard PPO
-            action, _ = agent.predict(
-                obs,
-                deterministic=deterministic,
-                min_action_confidence=min_action_confidence
-            )
+        action, _ = agent.predict(
+            obs,
+            deterministic=deterministic,
+            min_action_confidence=min_action_confidence
+        )
 
         # Step environment
         obs, reward, done, truncated, info = env.step(action)
@@ -699,9 +681,7 @@ def run_backtest(
         if hasattr(env, 'market_features') and len(env.market_features.shape) > 1:
             atr = env.market_features[bar_idx, 0]
 
-        # v23.1 PARITY FIX: Use EXECUTED action (after analyst masking), not intended action
-        # TradingEnv may have masked the action due to enforce_analyst_alignment=True
-        # Without this, backtest would take trades that training blocked
+        # v23.1 PARITY FIX: Use EXECUTED action, not intended action
         executed_action = action.copy()
         if 'executed_direction' in info:
             executed_action[0] = info['executed_direction']

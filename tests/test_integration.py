@@ -97,7 +97,7 @@ class TestTradingEnvIntegration:
                     break
             
             # Should have completed without exception
-            assert 'total_pnl' in info or True  # Info may vary
+            # Info dict contents may vary depending on terminal state
     
     def test_env_observation_consistency(self, trading_env):
         """Observations should be consistent dimension across steps."""

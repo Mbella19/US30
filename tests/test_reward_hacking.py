@@ -497,28 +497,6 @@ class TestMinimumHoldEnforcement:
     Tests for minimum hold time enforcement.
     """
 
-    def test_early_exit_penalty_if_enabled(self, trading_env):
-        """
-        With early_exit_penalty > 0, exits before min_hold should pay penalty.
-        """
-        env = trading_env
-
-        if env.early_exit_penalty == 0:
-            pytest.skip("Early exit penalty disabled")
-
-        env.reset()
-
-        # Open position
-        env.step(np.array([1, 1], dtype=np.int32))
-
-        # Try to exit immediately
-        _, reward, _, _, info = env.step(np.array([0, 0], dtype=np.int32))
-
-        # Should have penalty applied
-        assert info.get('early_exit_penalty_applied', False), (
-            "Early exit should trigger penalty when enabled"
-        )
-
     def test_instant_roundtrip_blocked_by_min_hold(self, trading_env):
         """
         With min_hold_bars > 0, instant exits should be BLOCKED.

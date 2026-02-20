@@ -61,16 +61,10 @@ class PathConfig:
     def models_agent(self) -> Path:
         return self.base_dir / "models" / "agent"
 
-    @property
-    def models_agent_recurrent(self) -> Path:
-        """RecurrentPPO model directory for parallel experiments."""
-        return self.base_dir / "models" / "agent_recurrent"
-
     def ensure_dirs(self):
         """Create all necessary directories."""
         for path in [self.data_raw, self.data_processed,
-                     self.models_analyst, self.models_agent,
-                     self.models_agent_recurrent]:
+                     self.models_analyst, self.models_agent]:
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -140,11 +134,6 @@ class OODConfig:
     """
     # Enable/disable OOD-based adaptations
     use_ood_detection: bool = True
-
-    # Trade Filters (block trades during problematic times)
-    use_trade_filters: bool = False  # Disabled - not trained with filters
-    blocked_hours: Tuple[int, ...] = (18, 19)  # UTC hours to block (6-7 PM = low liquidity)
-    blocked_days: Tuple[int, ...] = (6,)  # Days to block (6=Sunday)
 
     # OOD-based Position Sizing
     # ood_score=0 -> 100% position, ood_score=1 -> min_ratio position
@@ -241,15 +230,6 @@ class AnalystConfig:
     # Gradient accumulation for smoother updates (effective batch = batch_size * steps)
     gradient_accumulation_steps: int = 2  # Effective batch size = 128 * 2 = 256
 
-    # Multi-horizon prediction (addresses Target Mismatch)
-    # DISABLED: Gradient conflicts between horizons caused recall oscillation
-    use_multi_horizon: bool = False  # Was True - disabled to focus on single target
-    multi_horizon_weights: Dict[str, float] = field(default_factory=lambda: {
-        '1h': 0.0,   # 1-hour horizon weight - disabled
-        '2h': 0.0,   # 2-hour horizon weight - disabled
-        '4h': 1.0    # 4-hour horizon weight (primary target)
-    })
-
     # Legacy 3-class config (kept for compatibility)
     class_std_thresholds: Tuple[float, float] = (-0.15, 0.15)
 
@@ -277,24 +257,12 @@ class TradingConfig:
     # If False, agent trains with only raw market features (no analyst context/metrics)
     use_analyst: bool = False  # Agent uses analyst context in observation
 
-    # Regime-balanced episode start sampling.
-    # When enabled, the environment starts episodes evenly across Bullish/Ranging/Bearish
-    # regimes computed from the training data.
-    # v36 FIX: DISABLED - artificial 33/33/33 distribution doesn't match real market
-    use_regime_sampling: bool = False  # Use natural market distribution
-
-    spread_pips: float = 50.0    # Match US30 RL (50 was destroying profitability)
+    spread_pips: float = 50.0    # Intentional worst-case spread for robust training
     slippage_pips: float = 0.0  # US30 slippage
 
     # Confidence filtering: Only take trades when agent probability >= threshold
     min_action_confidence: float = 0.0  # Filter low-confidence trades (0.0 = disabled)
 
-    # NEW: Enforce Analyst Alignment (Action Masking)
-    # If True, Agent can ONLY trade in direction of Analyst (or Flat)
-    # When enabled, if agent tries to trade against analyst prediction, action is forced to Flat
-    # This constrains the agent to follow the Analyst's directional conviction
-    enforce_analyst_alignment: bool = False  # Disabled when use_analyst=False
-    
     # NEW: Risk-Based Sizing (Not Fixed Lots)
     risk_multipliers: Tuple[float, ...] = (1.5, 2.0, 2.5, 3.0)
     
@@ -312,7 +280,7 @@ class TradingConfig:
     
     # NEW: Dynamic Risk Sizing
     risk_use_percentage: bool = True  # Use % of Equity instead of fixed $
-    risk_percent: float = 1.0         # Risk 1.0% of Equity per trade
+    risk_percent: float = 5.0         # Risk 1.0% of Equity per trade
     
     # Reward Params (calibrated for US30)
     # US30 has ~100-200 point daily range vs EURUSD ~50-100 pip range
@@ -328,8 +296,7 @@ class TradingConfig:
     chop_threshold: float = 80.0     # Only extreme chop triggers penalty
     reward_scaling: float = 0.01    # 1.0 reward per 100 points (US30 calibration)
 
-    # Symmetric PnL Scaling (direction compensation handled separately)
-    # Asymmetric scaling removed - bullish bias is now handled via short_profit_multiplier/short_loss_multiplier
+    # Symmetric PnL Scaling
     profit_scaling: float = 0.01     # Symmetric with loss_scaling
     loss_scaling: float = 0.01       # 1.0x for losses (same as reward_scaling)
 
@@ -338,44 +305,15 @@ class TradingConfig:
     # abs(market_move) * 0.3 + 50 pip spread = impossible to get positive alpha on entry
     # Result: Agent collapsed to 99% flat with 0 trades
     use_alpha_reward: bool = True    # Keep True (controls reward scaling logic)
-    alpha_baseline_exposure: float = 0.0  # Moderate: must beat 50% of market move
+    alpha_baseline_exposure: float = 0.0  # Disabled: 0.0 = no baseline comparison (was causing flat collapse with 50 pip spread)
 
-    # Trade entry bonus: Partially offsets entry cost to encourage exploration
-    # Reduced from 0.1→0.05: was masking 100% of spread cost in reward space
-    # At 0.05, agent sees net -0.05 reward per entry (50% of true cost visible)
+    # Trade entry bonus: Disabled. Full spread cost visible to agent for realistic learning.
     trade_entry_bonus: float = 0.0
 
-    # Direction compensation REMOVED - multipliers were creating exploitable asymmetry
-    # Root cause: alpha rewards structurally favor shorts in bullish markets
-    # Solution: Remove multipliers entirely, rely on symmetric alpha + reduced baseline
-    short_profit_multiplier: float = 1.0   # No boost - symmetric
-    short_loss_multiplier: float = 1.0     # No reduction - symmetric
-    
-    # DEPRECATED: Position Holding Bonus - DISABLED to fix reward-PnL divergence
-    # Continuous PnL reward already incentivizes holding winners
-    holding_bonus: float = 0.0  # DEPRECATED - was causing reward inflation
-
-    # DEPRECATED: Early Exit Penalty - discourages scalping by penalizing premature exits
-    early_exit_penalty: float = 0.0  # DEPRECATED
-    min_bars_before_exit: int = 0    # Minimum bars before exit is allowed without penalty
-    
     # Underwater Decay Penalty - penalizes holding losing trades
     # Encourages cutting losses early, teaching agent to manage drawdown
     underwater_penalty_coef: float = 0.5    # Strong penalty for holding losers
     underwater_threshold_atr: float = 1.5     # Only penalize losses beyond this ATR threshold
-    
-    # Progressive Rewards Mode
-    # Now using asymmetric rewards: reward profit increases, tolerate pullbacks
-    # - Profit increase → positive reward
-    # - Minor pullback (within loss_tolerance_atr) → ZERO reward (no penalty!)
-    # - Deep drawdown (beyond loss_tolerance_atr) → negative reward
-    use_sparse_rewards: bool = False  # DEPRECATED - causes mode collapse to Flat
-
-    # Loss Tolerance Buffer (used with sparse_rewards=True)
-    # Allow some drawdown before stopping per-bar rewards
-    # This lets agent hold through normal retracements without panic exits
-    # Set to 0.5x ATR = if trade is down < 0.5x ATR, still get per-bar feedback
-    loss_tolerance_atr: float = 1.5  # Allow 1.5x ATR drawdown before sparse mode kicks in
     
     # Forced Minimum Hold Time
     # v36 FIX: ENABLED to prevent 1-bar scalping exploitation
@@ -408,32 +346,6 @@ class TradingConfig:
     # different market regimes, improving generalization to new data
     use_volatility_augmentation: bool = True
     volatility_augment_ratio: float = 0.3  # Fraction of samples to augment
-
-
-@dataclass
-class RecurrentAgentConfig:
-    """RecurrentPPO (LSTM-based) Agent configuration - EXPERIMENTAL.
-
-    Uses sb3-contrib RecurrentPPO with MlpLstmPolicy for temporal pattern learning.
-    This allows the agent to build internal memory state across timesteps.
-    """
-    # Enable/disable recurrent mode (default: False = use standard PPO)
-    use_recurrent: bool = False  # Disabled - using standard PPO (no LSTM, no analyst)
-
-    # LSTM-specific hyperparameters
-    lstm_hidden_size: int = 128       # Reduced from default 256 for M2 8GB
-    n_lstm_layers: int = 1            # Single layer for efficiency
-    shared_lstm: bool = False         # Separate actor/critic LSTMs (more expressive)
-    enable_critic_lstm: bool = True   # LSTM for value function too
-
-    # RecurrentPPO typically needs smaller batch sizes due to sequence handling
-    # These override AgentConfig values when use_recurrent=True
-    n_steps: int = 512                # Smaller rollout (sequence memory overhead)
-    batch_size: int = 64              # Smaller batch for memory efficiency
-
-    # Network architecture (feeds into LSTM)
-    net_arch_pi: List[int] = field(default_factory=lambda: [128])  # Policy pre-LSTM
-    net_arch_vf: List[int] = field(default_factory=lambda: [128])  # Value pre-LSTM
 
 
 @dataclass
@@ -561,7 +473,6 @@ class Config:
     instrument: InstrumentConfig = field(default_factory=InstrumentConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
-    recurrent_agent: RecurrentAgentConfig = field(default_factory=RecurrentAgentConfig)
     entropy_schedule: EntropyScheduleConfig = field(default_factory=EntropyScheduleConfig)
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)

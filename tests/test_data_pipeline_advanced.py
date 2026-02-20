@@ -293,19 +293,6 @@ class TestTargetGeneration:
                 assert cls_pct < 0.7, \
                     "Target class imbalance too severe (>70%)"
 
-    def test_multi_horizon_no_overlap_leak(self):
-        """Multi-horizon targets should not leak between horizons."""
-        # Target at horizon 5 should not know about horizon 10's future
-        # This is a design principle test
-
-        horizons = [5, 10, 20]
-
-        # Each horizon only looks at its specific future window
-        for h in horizons:
-            # At time t, target[h] uses data from t+1 to t+h
-            # This should not overlap incorrectly
-            assert h > 0, "Horizon must be positive"
-
 
 # =============================================================================
 # NORMALIZER TESTS

@@ -4,7 +4,7 @@ Gymnasium Trading Environment for the Sniper Agent.
 Features:
 - Multi-Discrete action space: [Direction (3), Size (4)]
 - Frozen Market Analyst provides context vectors
-- Reward shaping: PnL, transaction costs, FOMO penalty, chop avoidance
+- Reward shaping: PnL, transaction costs, alpha-based rewards, opportunity cost
 - Normalized observations (prevents scale inconsistencies)
 
 Optimized for M2 Silicon with all float32 operations.
@@ -32,7 +32,7 @@ class TradingEnv(gym.Env):
     Action Space:
         Multi-Discrete([3, 4]):
         - Direction: 0=Flat/Exit, 1=Long, 2=Short
-        - Size: 0=0.25x, 1=0.5x, 2=0.75x, 3=1.0x
+        - Size: 0=0.5x, 1=1.0x, 2=1.5x, 3=2.0x
 
     Observation Space:
         Box containing:
@@ -41,10 +41,10 @@ class TradingEnv(gym.Env):
         - Market features: [atr, chop, adx, regime, sma_distance]
 
     Reward:
-        Base PnL (pips) × position_size
+        Base PnL (pips) x position_size
         - Transaction cost when opening
-        - FOMO penalty when flat during momentum
-        - Chop penalty when holding in ranging market
+        - Alpha-based reward (outperformance vs passive strategy)
+        - Opportunity cost when flat or wrong direction during moves
     """
 
     metadata = {'render_modes': ['human']}
@@ -55,14 +55,6 @@ class TradingEnv(gym.Env):
     # The agent receives PnL changes as they occur, aligning rewards with the
     # equity curve and avoiding incentive to prematurely close to "lock in" a
     # large pending exit reward.
-    # Holding bonus (anti-reward-hacking):
-    # - Gated: only after trade is net profitable beyond entry costs + buffer.
-    # - Progress-based: pays only when reaching new profit milestones (high-water).
-    # - Capped: max bonus per trade is a small fraction of entry cost (in reward units).
-    HOLDING_BONUS_AMOUNT = 0.01
-    HOLDING_BONUS_CAP_FRACTION_OF_ENTRY_COST = 0.2
-    HOLDING_BONUS_BUFFER_FRACTION_OF_ENTRY_COST = 1.0
-    HOLDING_BONUS_MILESTONE_PIPS = 5.0
 
     def __init__(
         self,
@@ -81,8 +73,6 @@ class TradingEnv(gym.Env):
         point_multiplier: float = 1.0, # Dollar per point per lot
         spread_pips: float = 50.0,     # US30 spread with buffer
         slippage_pips: float = 0.0,   # US30 slippage
-        fomo_penalty: float = 0.0,  # DEPRECATED - now using opportunity cost
-        chop_penalty: float = 0.0,    # Disabled for stability
         fomo_threshold_atr: float = 2.0,  # Trigger on >4x ATR moves over lookback window
         fomo_lookback_bars: int = 20,     # Check move over 10 bars
         chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
@@ -91,14 +81,10 @@ class TradingEnv(gym.Env):
         # Symmetric PnL Scaling (direction compensation handled separately)
         profit_scaling: float = 0.01,   # Symmetric with loss_scaling
         loss_scaling: float = 0.01,     # 1.0x for losses
-        # Direction compensation REMOVED - symmetric multipliers
-        short_profit_multiplier: float = 1.0,  # No boost - symmetric
-        short_loss_multiplier: float = 1.0,    # No reduction - symmetric
         # Alpha-Based Reward - rewards OUTPERFORMANCE vs market, not absolute PnL
         use_alpha_reward: bool = True,   # Use relative returns instead of absolute PnL
         alpha_baseline_exposure: float = 0.3,  # 30% baseline - preserves 70% raw signal
         trade_entry_bonus: float = 0.0,    # DISABLED - alpha asymmetry provides trading incentive
-        holding_bonus: float = 0.0,        # DISABLED - was causing reward inflation
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
         market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
@@ -108,33 +94,21 @@ class TradingEnv(gym.Env):
         tp_atr_multiplier: float = 6.0, # TP at 3x ATR (1:3 R/R ratio)
         use_stop_loss: bool = True,     # Enable/disable stop-loss
         use_take_profit: bool = True,   # Enable/disable take-profit
-        # Regime-balanced sampling
-        regime_labels: Optional[np.ndarray] = None,  # 0=Bullish, 1=Ranging, 2=Bearish
-        use_regime_sampling: bool = True,  # Sample episodes balanced across regimes
         # Volatility Sizing (Dollar-based risk)
         volatility_sizing: bool = True,  # Scale position size to maintain constant dollar risk
         risk_per_trade: float = 100.0,   # Dollar risk per trade (e.g., $100 per trade)
         # Classification mode
         num_classes: int = 2,  # Binary (2) vs multi-class (3) - affects observation size
-        # Analyst Alignment
-        enforce_analyst_alignment: bool = False,  # If True, restrict actions to analyst direction
         # Pre-computed Analyst outputs (for sequential context)
         precomputed_analyst_cache: Optional[dict] = None,  # {'contexts': np.ndarray, 'probs': np.ndarray}
         # OHLC data for visualization (real candle data)
         ohlc_data: Optional[np.ndarray] = None,  # Shape: (n_samples, 4) with [open, high, low, close]
         timestamps: Optional[np.ndarray] = None,  # Optional timestamps for real time axis
         noise_level: float = 0.02,  # Reduced noise
-        # Sparse Rewards Mode
-        use_sparse_rewards: bool = False,  # DISABLED - causes mode collapse
-        # Loss Tolerance Buffer
-        loss_tolerance_atr: float = 0.5,  # Allow this much ATR drawdown before sparse mode kicks in
         # Forced Minimum Hold Time
-        min_hold_bars: int = 0,  # Disabled (use early_exit_penalty instead)
+        min_hold_bars: int = 0,  # Minimum bars before exit allowed
         early_exit_profit_atr: float = 3.0,  # Allow early exit if profit > this ATR multiple
         break_even_atr: float = 2.0,  # Move SL to break-even when profit reaches this ATR
-        # Early Exit Penalty - discourages scalping
-        early_exit_penalty: float = 0.0,  # Disabled
-        min_bars_before_exit: int = 10,    # Minimum bars before penalty-free exit
         # Underwater Decay Penalty - penalizes holding losing trades
         underwater_penalty_coef: float = 0.05,   # Strong penalty for holding losers
         underwater_threshold_atr: float = 1.0,    # Only penalize losses beyond this threshold
@@ -151,10 +125,6 @@ class TradingEnv(gym.Env):
         rolling_norm_min_samples: int = None,  # Defaults to config.trading.rolling_norm_min_samples
         rolling_window_size: int = None,       # Defaults to config.normalization.rolling_window_size
         clip_value: float = None,              # Defaults to config.normalization.clip_value
-        # v37 Trade Filters (block trades during problematic times)
-        use_trade_filters: bool = False,  # Enable/disable trade filtering
-        blocked_hours: tuple = (18, 19),  # UTC hours to block (6-7 PM = low liquidity)
-        blocked_days: tuple = (6,),  # Days to block (6=Sunday)
         # v37 OOD Position Sizing (aggressive reduction based on ood_score)
         ood_size_reduction_factor: float = 0.8,  # How aggressively to reduce (0.8 = 20% to 100%)
         min_position_size_ratio: float = 0.2,  # Minimum position size (20% of normal)
@@ -173,8 +143,6 @@ class TradingEnv(gym.Env):
             context_dim: Dimension of context vector
             lookback_*: Lookback windows for each timeframe
             spread_pips: Transaction cost in pips
-            fomo_penalty: Penalty for being flat during momentum
-            chop_penalty: Penalty for holding in ranging market
             fomo_threshold_atr: ATR multiplier for FOMO detection
             chop_threshold: Choppiness index threshold
             max_steps: Maximum steps per episode
@@ -242,8 +210,6 @@ class TradingEnv(gym.Env):
         self.point_multiplier = point_multiplier  # Dollar per point per lot (1.0)
         self.spread_pips = spread_pips
         self.slippage_pips = slippage_pips  # Realistic execution slippage
-        self.fomo_penalty = fomo_penalty
-        self.chop_penalty = chop_penalty
         self.fomo_threshold_atr = fomo_threshold_atr
         self.fomo_lookback_bars = fomo_lookback_bars  # Multi-bar FOMO check
         self.chop_threshold = chop_threshold
@@ -252,14 +218,10 @@ class TradingEnv(gym.Env):
         # PnL Scaling (symmetric)
         self.profit_scaling = profit_scaling
         self.loss_scaling = loss_scaling
-        # Direction-Compensated Rewards
-        self.short_profit_multiplier = short_profit_multiplier
-        self.short_loss_multiplier = short_loss_multiplier
         # Alpha-Based Reward
         self.use_alpha_reward = use_alpha_reward
         self.alpha_baseline_exposure = alpha_baseline_exposure
         self.trade_entry_bonus = trade_entry_bonus  # Bonus for opening positions
-        self.holding_bonus = holding_bonus  # Bonus for staying in profitable trades
 
         # Risk Management - Stop-Loss and Take-Profit
         self.sl_atr_multiplier = sl_atr_multiplier
@@ -271,23 +233,12 @@ class TradingEnv(gym.Env):
         self.volatility_sizing = volatility_sizing
         self.risk_per_trade = risk_per_trade  # Dollar risk per trade
         
-        # Analyst Alignment
-        self.enforce_analyst_alignment = enforce_analyst_alignment
-        self.current_probs = None  # Store for action masking
-        
-        # Sparse Rewards - only reward on trade exit
-        self.use_sparse_rewards = use_sparse_rewards
-        # Loss Tolerance Buffer
-        self.loss_tolerance_atr = loss_tolerance_atr
         # Forced Minimum Hold Time
         self.min_hold_bars = min_hold_bars
         self.early_exit_profit_atr = early_exit_profit_atr  # Allow early exit if profit > this ATR
         self.break_even_atr = break_even_atr  # Move SL to break-even at this profit
         self.break_even_activated = False  # Track if break-even has been triggered
         self.entry_idx = 0  # Track when position was opened
-        # Early Exit Penalty
-        self.early_exit_penalty = early_exit_penalty
-        self.min_bars_before_exit = min_bars_before_exit
         # Underwater Decay Penalty
         self.underwater_penalty_coef = underwater_penalty_coef
         self.underwater_threshold_atr = underwater_threshold_atr
@@ -295,10 +246,6 @@ class TradingEnv(gym.Env):
         self.opportunity_cost_multiplier = opportunity_cost_multiplier
         self.opportunity_cost_cap = opportunity_cost_cap
 
-        # v37 Trade Filters
-        self.use_trade_filters = use_trade_filters
-        self.blocked_hours = set(blocked_hours)
-        self.blocked_days = set(blocked_days)
         # v37 OOD Position Sizing
         self.ood_size_reduction_factor = ood_size_reduction_factor
         self.min_position_size_ratio = min_position_size_ratio
@@ -311,33 +258,12 @@ class TradingEnv(gym.Env):
         else:
             # Only compute start_idx if using raw DataFrames (create_env_from_dataframes)
             # Subsample ratios: 15m = 3x base (5m), 45m = 9x base (5m)
-            self.start_idx = max(lookback_5m, lookback_15m * 3, lookback_45m * 9)
+            # Formula matches prepare_env_data: need (lookback-1)*subsample+1 aligned 5m bars
+            self.start_idx = max(lookback_5m, (lookback_15m - 1) * 3 + 1, (lookback_45m - 1) * 9 + 1)
         
         self.end_idx = len(close_prices) - 1
         self.n_samples = self.end_idx - self.start_idx
         
-        # Regime-balanced sampling (AFTER start_idx/end_idx are set)
-        self.use_regime_sampling = use_regime_sampling and regime_labels is not None
-        if regime_labels is not None:
-            self.regime_labels = regime_labels.astype(np.int32)
-            # Pre-compute indices for each regime (0=Bullish, 1=Ranging, 2=Bearish)
-            self.regime_indices = {
-                0: np.where(self.regime_labels == 0)[0],  # Bullish
-                1: np.where(self.regime_labels == 1)[0],  # Ranging
-                2: np.where(self.regime_labels == 2)[0],  # Bearish
-            }
-            # Filter to valid range for episode starts
-            max_start = max(self.start_idx + 1, self.end_idx - max_steps)
-            for regime in self.regime_indices:
-                valid = self.regime_indices[regime]
-                valid = valid[(valid >= self.start_idx) & (valid < max_start)]
-                self.regime_indices[regime] = valid
-            logger.debug(f"Regime sampling enabled: Bullish={len(self.regime_indices[0])}, "
-                         f"Ranging={len(self.regime_indices[1])}, Bearish={len(self.regime_indices[2])}")
-        else:
-            self.regime_labels = None
-            self.regime_indices = None
-
         # Action space: Multi-Discrete([direction, size])
         # Direction: 0=Flat, 1=Long, 2=Short
         # Size: 0=0.25, 1=0.5, 2=0.75, 3=1.0
@@ -433,9 +359,6 @@ class TradingEnv(gym.Env):
         self.total_pnl = 0.0
         self.trades = []
         self.prev_unrealized_pnl = 0.0  # Track for continuous PnL rewards
-        # Holding-bonus state (reset on every new trade)
-        self._holding_bonus_paid = 0.0
-        self._holding_bonus_level = 0
         self.break_even_activated = False  # Reset break-even flag
         # High-water mark for progressive rewards (reset on every new trade)
         self._profit_high_water_mark = 0.0
@@ -623,45 +546,6 @@ class TradingEnv(gym.Env):
             None
         )
 
-    def _should_block_trade(self, direction: int) -> bool:
-        """
-        v37 Trade Filters: Check if trade should be blocked based on time.
-
-        Blocks trades during:
-        - Problematic hours (e.g., 6-7 PM UTC = low liquidity)
-        - Problematic days (e.g., Sunday = 11.1% win rate in OOS analysis)
-
-        Args:
-            direction: Requested trade direction (0=Flat, 1=Long, 2=Short)
-
-        Returns:
-            True if trade should be blocked, False otherwise
-        """
-        # Only block entry trades, not exits
-        if direction == 0:
-            return False
-
-        if not self.use_trade_filters:
-            return False
-
-        # Get current hour/day from timestamps
-        if self.timestamps is not None and self.current_idx < len(self.timestamps):
-            try:
-                current_ts = self.timestamps[self.current_idx]
-                # Convert Unix timestamp to datetime
-                dt = pd.Timestamp(current_ts, unit='s', tz='UTC')
-                hour = dt.hour
-                day = dt.dayofweek  # 0=Monday, 6=Sunday
-
-                if hour in self.blocked_hours:
-                    return True
-                if day in self.blocked_days:
-                    return True
-            except Exception:
-                pass  # Silently ignore timestamp parsing errors
-
-        return False
-
     def _get_observation(self) -> np.ndarray:
         """Construct observation vector."""
         # Context vector and probabilities (only when analyst is enabled)
@@ -795,7 +679,7 @@ class TradingEnv(gym.Env):
 
         # Combine all features
         # v40 FIX: Updated comment to reflect actual observation layout:
-        # [context (64), position (4), market (33*3=99), analyst_metrics (5-6), sl_tp (2), hold (4), returns (12)]
+        # [context (64), position (4), market (36*3=108), analyst_metrics (5-6), sl_tp (2), hold (4), returns (12)]
         
         # SL/TP Blind Spot Fix: Calculate normalized distance to expected SL/TP levels
         dist_sl_norm = 0.0
@@ -905,8 +789,8 @@ class TradingEnv(gym.Env):
             if idx_start < 0:
                 # Pad with zeros if we are at the very beginning (unlikely due to start_idx)
                 returns_slice = np.zeros(self.agent_lookback_window, dtype=np.float32)
-                valid_len = idx_end
-                returns_slice[-valid_len:] = self.returns[0:idx_end]
+                valid_len = min(idx_end, len(self.returns))
+                returns_slice[-valid_len:] = self.returns[0:valid_len]
             else:
                 returns_slice = self.returns[idx_start:idx_end]
             
@@ -1028,30 +912,25 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
-                self._holding_bonus_paid = 0.0
-                self._holding_bonus_level = 0
+
                 self._profit_high_water_mark = 0.0
                 self.break_even_activated = False
                 self.entry_atr = 0.0
 
-                # v24 FIX: In sparse mode, reward FULL trade PnL
-                if self.use_sparse_rewards:
-                    sl_reward = pnl * self.reward_scaling
-                else:
-                    # v31 FIX: Apply alpha to SL reward (Long closing)
-                    if self.use_alpha_reward and self.current_idx > 0:
-                        current_price = self.close_prices[self.current_idx]
-                        prev_price = self.close_prices[self.current_idx - 1]
-                        market_move_pips = (current_price - prev_price) / self.pip_value
-                        # v41 FIX: Directional baseline — closing LONG, so buy-and-hold baseline
-                        exit_baseline = market_move_pips * self.alpha_baseline_exposure * saved_position_size
-                        exit_alpha = final_delta - exit_baseline
-                        if exit_alpha > 0:
-                            sl_reward = exit_alpha * self.profit_scaling
-                        else:
-                            sl_reward = exit_alpha * self.loss_scaling
+                # v31 FIX: Apply alpha to SL reward (Long closing)
+                if self.use_alpha_reward and self.current_idx > 0:
+                    current_price = self.close_prices[self.current_idx]
+                    prev_price = self.close_prices[self.current_idx - 1]
+                    market_move_pips = (current_price - prev_price) / self.pip_value
+                    # v41 FIX: Directional baseline — closing LONG, so buy-and-hold baseline
+                    exit_baseline = market_move_pips * self.alpha_baseline_exposure * saved_position_size
+                    exit_alpha = final_delta - exit_baseline
+                    if exit_alpha > 0:
+                        sl_reward = exit_alpha * self.profit_scaling
                     else:
-                        sl_reward = final_delta * self.reward_scaling
+                        sl_reward = exit_alpha * self.loss_scaling
+                else:
+                    sl_reward = final_delta * self.reward_scaling
 
                 return sl_reward, {
                     'stop_loss_triggered': True,
@@ -1090,30 +969,25 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
-                self._holding_bonus_paid = 0.0
-                self._holding_bonus_level = 0
+
                 self._profit_high_water_mark = 0.0
                 self.break_even_activated = False
                 self.entry_atr = 0.0
 
-                # v24 FIX: In sparse mode, reward FULL trade PnL
-                if self.use_sparse_rewards:
-                    tp_reward = pnl * self.reward_scaling
-                else:
-                    # v31 FIX: Apply alpha to TP reward (Long closing)
-                    if self.use_alpha_reward and self.current_idx > 0:
-                        current_price = self.close_prices[self.current_idx]
-                        prev_price = self.close_prices[self.current_idx - 1]
-                        market_move_pips = (current_price - prev_price) / self.pip_value
-                        # v41 FIX: Directional baseline — closing LONG, so buy-and-hold baseline
-                        exit_baseline = market_move_pips * self.alpha_baseline_exposure * saved_position_size
-                        exit_alpha = final_delta - exit_baseline
-                        if exit_alpha > 0:
-                            tp_reward = exit_alpha * self.profit_scaling
-                        else:
-                            tp_reward = exit_alpha * self.loss_scaling
+                # v31 FIX: Apply alpha to TP reward (Long closing)
+                if self.use_alpha_reward and self.current_idx > 0:
+                    current_price = self.close_prices[self.current_idx]
+                    prev_price = self.close_prices[self.current_idx - 1]
+                    market_move_pips = (current_price - prev_price) / self.pip_value
+                    # v41 FIX: Directional baseline — closing LONG, so buy-and-hold baseline
+                    exit_baseline = market_move_pips * self.alpha_baseline_exposure * saved_position_size
+                    exit_alpha = final_delta - exit_baseline
+                    if exit_alpha > 0:
+                        tp_reward = exit_alpha * self.profit_scaling
                     else:
-                        tp_reward = final_delta * self.reward_scaling
+                        tp_reward = exit_alpha * self.loss_scaling
+                else:
+                    tp_reward = final_delta * self.reward_scaling
 
                 return tp_reward, {
                     'take_profit_triggered': True,
@@ -1157,31 +1031,26 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
-                self._holding_bonus_paid = 0.0
-                self._holding_bonus_level = 0
+
                 self._profit_high_water_mark = 0.0
                 self.break_even_activated = False
                 self.entry_atr = 0.0
 
                 # v24 FIX: In sparse mode, reward FULL trade PnL
-                if self.use_sparse_rewards:
-                    sl_reward = pnl * self.reward_scaling
-                else:
-                    # v31 FIX: Apply alpha to SL reward (Short closing)
-                    if self.use_alpha_reward and self.current_idx > 0:
-                        current_price = self.close_prices[self.current_idx]
-                        prev_price = self.close_prices[self.current_idx - 1]
-                        market_move_pips = (current_price - prev_price) / self.pip_value
-                        # v41 FIX: Directional baseline — closing SHORT, so sell-and-hold baseline
-                        exit_baseline = -market_move_pips * self.alpha_baseline_exposure * saved_position_size
-                        exit_alpha = final_delta - exit_baseline
-                        # Direction-compensated rewards for short positions
-                        if exit_alpha > 0:
-                            sl_reward = exit_alpha * self.profit_scaling * self.short_profit_multiplier
-                        else:
-                            sl_reward = exit_alpha * self.loss_scaling * self.short_loss_multiplier
+                # v31 FIX: Apply alpha to SL reward (Short closing)
+                if self.use_alpha_reward and self.current_idx > 0:
+                    current_price = self.close_prices[self.current_idx]
+                    prev_price = self.close_prices[self.current_idx - 1]
+                    market_move_pips = (current_price - prev_price) / self.pip_value
+                    # v41 FIX: Directional baseline — closing SHORT, so sell-and-hold baseline
+                    exit_baseline = -market_move_pips * self.alpha_baseline_exposure * saved_position_size
+                    exit_alpha = final_delta - exit_baseline
+                    if exit_alpha > 0:
+                        sl_reward = exit_alpha * self.profit_scaling
                     else:
-                        sl_reward = final_delta * self.reward_scaling
+                        sl_reward = exit_alpha * self.loss_scaling
+                else:
+                    sl_reward = final_delta * self.reward_scaling
 
                 return sl_reward, {
                     'stop_loss_triggered': True,
@@ -1220,31 +1089,25 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
-                self._holding_bonus_paid = 0.0
-                self._holding_bonus_level = 0
+
                 self._profit_high_water_mark = 0.0
                 self.break_even_activated = False
                 self.entry_atr = 0.0
 
-                # v24 FIX: In sparse mode, reward FULL trade PnL
-                if self.use_sparse_rewards:
-                    tp_reward = pnl * self.reward_scaling
-                else:
-                    # v31 FIX: Apply alpha to TP reward (Short closing)
-                    if self.use_alpha_reward and self.current_idx > 0:
-                        current_price = self.close_prices[self.current_idx]
-                        prev_price = self.close_prices[self.current_idx - 1]
-                        market_move_pips = (current_price - prev_price) / self.pip_value
-                        # v41 FIX: Directional baseline — closing SHORT, so sell-and-hold baseline
-                        exit_baseline = -market_move_pips * self.alpha_baseline_exposure * saved_position_size
-                        exit_alpha = final_delta - exit_baseline
-                        # Direction-compensated rewards for short positions
-                        if exit_alpha > 0:
-                            tp_reward = exit_alpha * self.profit_scaling * self.short_profit_multiplier
-                        else:
-                            tp_reward = exit_alpha * self.loss_scaling * self.short_loss_multiplier
+                # v31 FIX: Apply alpha to TP reward (Short closing)
+                if self.use_alpha_reward and self.current_idx > 0:
+                    current_price = self.close_prices[self.current_idx]
+                    prev_price = self.close_prices[self.current_idx - 1]
+                    market_move_pips = (current_price - prev_price) / self.pip_value
+                    # v41 FIX: Directional baseline — closing SHORT, so sell-and-hold baseline
+                    exit_baseline = -market_move_pips * self.alpha_baseline_exposure * saved_position_size
+                    exit_alpha = final_delta - exit_baseline
+                    if exit_alpha > 0:
+                        tp_reward = exit_alpha * self.profit_scaling
                     else:
-                        tp_reward = final_delta * self.reward_scaling
+                        tp_reward = exit_alpha * self.loss_scaling
+                else:
+                    tp_reward = final_delta * self.reward_scaling
 
                 return tp_reward, {
                     'take_profit_triggered': True,
@@ -1265,58 +1128,6 @@ class TradingEnv(gym.Env):
         direction = int(action[0])  # 0=Flat, 1=Long, 2=Short
         size_idx = int(action[1])   # 0-3
 
-        # v37 Trade Filters: Block trades during problematic times
-        if self._should_block_trade(direction):
-            # Force to Flat/Exit during blocked times
-            direction = 0
-
-        # Enforce Analyst Alignment (Action Masking)
-        if self.enforce_analyst_alignment and self.current_probs is not None:
-            # Determine Analyst Direction
-            # Binary: [p_down, p_up] -> 0=Down, 1=Up
-            # Multi: [p_down, p_neutral, p_up] -> 0=Down, 1=Neutral, 2=Up
-            
-            analyst_dir = 0 # Default Flat
-            
-            if len(self.current_probs) == 2:
-                # Binary: 0=Short, 1=Long (mapped to env: 2=Short, 1=Long)
-                p_down, p_up = self.current_probs
-                if p_up > 0.5:
-                    analyst_dir = 1 # Long
-                elif p_down > 0.5:
-                    analyst_dir = 2 # Short
-                # Else neutral/uncertain
-                
-            elif len(self.current_probs) == 3:
-                # Multi: 0=Down, 1=Neutral, 2=Up
-                p_down, p_neutral, p_up = self.current_probs
-                max_idx = np.argmax(self.current_probs)
-                if max_idx == 2: # Up
-                    analyst_dir = 1 # Long
-                elif max_idx == 0: # Down
-                    analyst_dir = 2 # Short
-                else:
-                    analyst_dir = 0 # Flat
-            
-            # Check for violation
-            # If Analyst is Long (1), Agent cannot be Short (2)
-            # If Analyst is Short (2), Agent cannot be Long (1)
-            # If Analyst is Flat (0), Agent must be Flat (0)
-            
-            violation = False
-            if analyst_dir == 1 and direction == 2: # Analyst Long, Agent Short
-                violation = True
-            elif analyst_dir == 2 and direction == 1: # Analyst Short, Agent Long
-                violation = True
-            elif analyst_dir == 0 and direction != 0: # Analyst Flat, Agent Active
-                violation = True
-                
-            if violation:
-                # Force Flat Action
-                direction = 0
-                # Optional: Add small penalty? No, just prevent the action.
-                # The agent will learn that this action does nothing.
-        
         base_size = self.POSITION_SIZES[size_idx]
         
         # Dollar-Based Volatility Sizing: Maintain constant dollar risk per trade
@@ -1448,54 +1259,35 @@ class TradingEnv(gym.Env):
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 pnl_delta += final_delta
                 
-                # v24 FIX: In sparse mode, reward FULL trade PnL (not just final delta)
-                # because no per-bar rewards were given during the trade
-                if self.use_sparse_rewards:
-                    reward += final_unrealized * self.reward_scaling
-                else:
-                    # v31 FIX: Apply alpha calculation to exit reward (same as holding)
-                    # Without this, exit gives raw delta reward, bypassing alpha logic
-                    if self.use_alpha_reward and self.current_idx > 0:
-                        current_price = self.close_prices[self.current_idx]
-                        prev_price = self.close_prices[self.current_idx - 1]
-                        market_move_pips = (current_price - prev_price) / self.pip_value
+                # v31 FIX: Apply alpha calculation to exit reward (same as holding)
+                # Without this, exit gives raw delta reward, bypassing alpha logic
+                if self.use_alpha_reward and self.current_idx > 0:
+                    current_price = self.close_prices[self.current_idx]
+                    prev_price = self.close_prices[self.current_idx - 1]
+                    market_move_pips = (current_price - prev_price) / self.pip_value
 
-                        # v41 FIX: Directional baseline (long→B&H, short→S&H)
-                        if self.position == 1:
-                            exit_baseline = market_move_pips * self.alpha_baseline_exposure * self.position_size
-                        else:
-                            exit_baseline = -market_move_pips * self.alpha_baseline_exposure * self.position_size
-
-                        exit_alpha = final_delta - exit_baseline
-
-                        # Direction-compensated rewards
-                        if self.position == -1:  # Short position closing
-                            if exit_alpha > 0:
-                                reward += exit_alpha * self.profit_scaling * self.short_profit_multiplier
-                            else:
-                                reward += exit_alpha * self.loss_scaling * self.short_loss_multiplier
-                        else:  # Long position closing
-                            if exit_alpha > 0:
-                                reward += exit_alpha * self.profit_scaling
-                            else:
-                                reward += exit_alpha * self.loss_scaling
-                        info['exit_alpha'] = exit_alpha
+                    # v41 FIX: Directional baseline (long->B&H, short->S&H)
+                    if self.position == 1:
+                        exit_baseline = market_move_pips * self.alpha_baseline_exposure * self.position_size
                     else:
-                        # Fallback: raw delta (when alpha disabled)
-                        reward += final_delta * self.reward_scaling
+                        exit_baseline = -market_move_pips * self.alpha_baseline_exposure * self.position_size
+
+                    exit_alpha = final_delta - exit_baseline
+
+                    if exit_alpha > 0:
+                        reward += exit_alpha * self.profit_scaling
+                    else:
+                        reward += exit_alpha * self.loss_scaling
+                    info['exit_alpha'] = exit_alpha
+                else:
+                    # Fallback: raw delta (when alpha disabled)
+                    reward += final_delta * self.reward_scaling
 
                 # REMOVED: Direction bonus was causing reward-PnL divergence
                 # The bonus (+2.5 for ANY profitable trade) was 50x larger than
                 # the PnL reward for tiny winners, teaching agent to make many
                 # small trades to collect bonuses regardless of actual profitability.
                 # PnL delta (above) is now the ONLY source of reward for exits.
-
-                # Early Exit Penalty - penalize premature closes to discourage scalping
-                bars_held = self.current_idx - self.entry_idx
-                if bars_held < self.min_bars_before_exit and self.early_exit_penalty != 0:
-                    reward += self.early_exit_penalty
-                    info['early_exit_penalty'] = self.early_exit_penalty
-                    info['bars_held_at_exit'] = bars_held
 
                 # Record trade statistics
                 info['trade_closed'] = True
@@ -1517,8 +1309,7 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
-                self._holding_bonus_paid = 0.0
-                self._holding_bonus_level = 0
+
                 self._profit_high_water_mark = 0.0
                 self.break_even_activated = False
                 self.entry_atr = 0.0
@@ -1530,34 +1321,21 @@ class TradingEnv(gym.Env):
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 pnl_delta += final_delta
 
-                # v24 FIX: In sparse mode, reward FULL trade PnL
-                if self.use_sparse_rewards:
-                    reward += final_unrealized * self.reward_scaling
-                else:
-                    # v31 FIX: Apply alpha calculation to flip exit (Short→Long)
-                    if self.use_alpha_reward and self.current_idx > 0:
-                        current_price = self.close_prices[self.current_idx]
-                        prev_price = self.close_prices[self.current_idx - 1]
-                        market_move_pips = (current_price - prev_price) / self.pip_value
-                        # v41 FIX: Directional baseline — closing SHORT, so sell-and-hold baseline
-                        exit_baseline = -market_move_pips * self.alpha_baseline_exposure * self.position_size
-                        exit_alpha = final_delta - exit_baseline
-                        # Direction-compensated rewards for short position closing
-                        if exit_alpha > 0:
-                            reward += exit_alpha * self.profit_scaling * self.short_profit_multiplier
-                        else:
-                            reward += exit_alpha * self.loss_scaling * self.short_loss_multiplier
-                        info['exit_alpha'] = exit_alpha
+                # v31 FIX: Apply alpha calculation to flip exit (Short->Long)
+                if self.use_alpha_reward and self.current_idx > 0:
+                    current_price = self.close_prices[self.current_idx]
+                    prev_price = self.close_prices[self.current_idx - 1]
+                    market_move_pips = (current_price - prev_price) / self.pip_value
+                    # v41 FIX: Directional baseline -- closing SHORT, so sell-and-hold baseline
+                    exit_baseline = -market_move_pips * self.alpha_baseline_exposure * self.position_size
+                    exit_alpha = final_delta - exit_baseline
+                    if exit_alpha > 0:
+                        reward += exit_alpha * self.profit_scaling
                     else:
-                        reward += final_delta * self.reward_scaling
-
-                # REMOVED: Direction bonus (see comment in Flat/Exit case above)
-
-                # Early Exit Penalty - penalize premature flips
-                bars_held = self.current_idx - self.entry_idx
-                if bars_held < self.min_bars_before_exit and self.early_exit_penalty != 0:
-                    reward += self.early_exit_penalty
-                    info['early_exit_penalty'] = self.early_exit_penalty
+                        reward += exit_alpha * self.loss_scaling
+                    info['exit_alpha'] = exit_alpha
+                else:
+                    reward += final_delta * self.reward_scaling
 
                 info['trade_closed'] = True
                 info['pnl'] = final_unrealized
@@ -1578,8 +1356,7 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
-                self._holding_bonus_paid = 0.0
-                self._holding_bonus_level = 0
+
                 self._profit_high_water_mark = 0.0
                 self.break_even_activated = False
                 self.entry_atr = 0.0
@@ -1590,9 +1367,8 @@ class TradingEnv(gym.Env):
                 self.entry_price = current_price
                 self.entry_atr = atr  # Store ATR at entry for fixed SL/TP
                 self.entry_idx = self.current_idx  # Track entry bar for min hold time
-                # Reset holding-bonus state for the new trade
-                self._holding_bonus_paid = 0.0
-                self._holding_bonus_level = 0
+
+
                 # Total execution cost = spread + slippage (realistic modeling)
                 exec_cost = (self.spread_pips + self.slippage_pips) * new_size
                 reward -= exec_cost * self.reward_scaling
@@ -1613,33 +1389,21 @@ class TradingEnv(gym.Env):
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 pnl_delta += final_delta
 
-                # v24 FIX: In sparse mode, reward FULL trade PnL
-                if self.use_sparse_rewards:
-                    reward += final_unrealized * self.reward_scaling
-                else:
-                    # v31 FIX: Apply alpha calculation to flip exit (Long→Short)
-                    if self.use_alpha_reward and self.current_idx > 0:
-                        current_price = self.close_prices[self.current_idx]
-                        prev_price = self.close_prices[self.current_idx - 1]
-                        market_move_pips = (current_price - prev_price) / self.pip_value
-                        # v41 FIX: Directional baseline — closing LONG, so buy-and-hold baseline
-                        exit_baseline = market_move_pips * self.alpha_baseline_exposure * self.position_size
-                        exit_alpha = final_delta - exit_baseline
-                        if exit_alpha > 0:
-                            reward += exit_alpha * self.profit_scaling
-                        else:
-                            reward += exit_alpha * self.loss_scaling
-                        info['exit_alpha'] = exit_alpha
+                # v31 FIX: Apply alpha calculation to flip exit (Long->Short)
+                if self.use_alpha_reward and self.current_idx > 0:
+                    current_price = self.close_prices[self.current_idx]
+                    prev_price = self.close_prices[self.current_idx - 1]
+                    market_move_pips = (current_price - prev_price) / self.pip_value
+                    # v41 FIX: Directional baseline -- closing LONG, so buy-and-hold baseline
+                    exit_baseline = market_move_pips * self.alpha_baseline_exposure * self.position_size
+                    exit_alpha = final_delta - exit_baseline
+                    if exit_alpha > 0:
+                        reward += exit_alpha * self.profit_scaling
                     else:
-                        reward += final_delta * self.reward_scaling
-
-                # REMOVED: Direction bonus (see comment in Flat/Exit case above)
-
-                # Early Exit Penalty - penalize premature flips
-                bars_held = self.current_idx - self.entry_idx
-                if bars_held < self.min_bars_before_exit and self.early_exit_penalty != 0:
-                    reward += self.early_exit_penalty
-                    info['early_exit_penalty'] = self.early_exit_penalty
+                        reward += exit_alpha * self.loss_scaling
+                    info['exit_alpha'] = exit_alpha
+                else:
+                    reward += final_delta * self.reward_scaling
 
                 info['trade_closed'] = True
                 info['pnl'] = final_unrealized
@@ -1660,8 +1424,7 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
-                self._holding_bonus_paid = 0.0
-                self._holding_bonus_level = 0
+
                 self._profit_high_water_mark = 0.0
                 self.break_even_activated = False
                 self.entry_atr = 0.0
@@ -1672,9 +1435,8 @@ class TradingEnv(gym.Env):
                 self.entry_price = current_price
                 self.entry_atr = atr  # Store ATR at entry for fixed SL/TP
                 self.entry_idx = self.current_idx  # Track entry bar for min hold time
-                # Reset holding-bonus state for the new trade
-                self._holding_bonus_paid = 0.0
-                self._holding_bonus_level = 0
+
+
                 # Total execution cost = spread + slippage (realistic modeling)
                 exec_cost = (self.spread_pips + self.slippage_pips) * new_size
                 reward -= exec_cost * self.reward_scaling
@@ -1692,88 +1454,57 @@ class TradingEnv(gym.Env):
         # Pure mark-to-market PnL delta - the agent receives reward proportional to
         # the actual change in unrealized PnL each step. This is the correct signal
         # for learning trading behavior:
-        #   - Price moves in favor → positive reward
-        #   - Price moves against → negative reward
+        #   - Price moves in favor -> positive reward
+        #   - Price moves against -> negative reward
         #   - Agent learns "price up = good for long, price down = bad for long"
-        #
-        # v24 FIX: Only apply continuous rewards if sparse mode is DISABLED.
-        # When use_sparse_rewards=True, agent only gets reward on trade exit.
         if self.position != 0:
             current_unrealized_pnl = self._calculate_unrealized_pnl()
             pnl_delta = current_unrealized_pnl - self.prev_unrealized_pnl
 
-            # Only add per-bar PnL if NOT using sparse rewards
-            if not self.use_sparse_rewards:
-                # Alpha-Based Reward - rewards OUTPERFORMANCE vs market, not absolute PnL
-                # This removes directional bias: being long in bull market = 0 alpha
-                if self.use_alpha_reward and self.current_idx > 0:
-                    # Calculate market move (what buy-and-hold would have made)
-                    current_price = self.close_prices[self.current_idx]
-                    prev_price = self.close_prices[self.current_idx - 1]
-                    market_move_pips = (current_price - prev_price) / self.pip_value
+            # Alpha-Based Reward - rewards OUTPERFORMANCE vs market, not absolute PnL
+            # This removes directional bias: being long in bull market = 0 alpha
+            if self.use_alpha_reward and self.current_idx > 0:
+                # Calculate market move (what buy-and-hold would have made)
+                current_price = self.close_prices[self.current_idx]
+                prev_price = self.close_prices[self.current_idx - 1]
+                market_move_pips = (current_price - prev_price) / self.pip_value
 
-                    # v41 FIX: Directional alpha baseline
-                    # Each direction is compared to its own passive strategy:
-                    #   Long  → compared to buy-and-hold  (baseline = +market_move)
-                    #   Short → compared to sell-and-hold (baseline = -market_move)
-                    # This gives alpha=0 when matching the passive version of your direction
-                    if self.position == 1:  # Long
-                        baseline_pnl = market_move_pips * self.alpha_baseline_exposure * self.position_size
-                    elif self.position == -1:  # Short
-                        baseline_pnl = -market_move_pips * self.alpha_baseline_exposure * self.position_size
-                    else:
-                        baseline_pnl = 0
-
-                    # Alpha = actual PnL - baseline PnL (outperformance vs passive strategy)
-                    # Long +100 when market +100: alpha = 100 - 30 = +70 (good, followed trend)
-                    # Short +100 when market -100: alpha = 100 - 30 = +70 (good, followed trend)
-                    # Long -100 when market -100: alpha = -100 - (-30) = -70 (bad, fought trend)
-                    # Short -100 when market +100: alpha = -100 - (-30) = -70 (bad, fought trend)
-                    alpha = pnl_delta - baseline_pnl
-
-                    # Apply direction-compensated scaling to alpha
-                    # Short positions get boosted profits and reduced loss penalties
-                    # to compensate for the bullish bias in training data
-                    if self.position == -1:  # Short position
-                        if alpha > 0:
-                            reward += alpha * self.profit_scaling * self.short_profit_multiplier
-                        else:
-                            reward += alpha * self.loss_scaling * self.short_loss_multiplier
-                    else:  # Long or flat
-                        if alpha > 0:
-                            reward += alpha * self.profit_scaling
-                        else:
-                            reward += alpha * self.loss_scaling
-
-                    info['alpha'] = alpha
-                    info['baseline_pnl'] = baseline_pnl
-                    info['market_move'] = market_move_pips
-                    info['reward_type'] = 'alpha_reward'
+                # v41 FIX: Directional alpha baseline
+                # Each direction is compared to its own passive strategy:
+                #   Long  -> compared to buy-and-hold  (baseline = +market_move)
+                #   Short -> compared to sell-and-hold (baseline = -market_move)
+                # This gives alpha=0 when matching the passive version of your direction
+                if self.position == 1:  # Long
+                    baseline_pnl = market_move_pips * self.alpha_baseline_exposure * self.position_size
+                elif self.position == -1:  # Short
+                    baseline_pnl = -market_move_pips * self.alpha_baseline_exposure * self.position_size
                 else:
-                    # Asymmetric PnL Scaling (fallback when alpha disabled)
-                    if pnl_delta > 0:
-                        reward += pnl_delta * self.profit_scaling
-                    else:
-                        reward += pnl_delta * self.loss_scaling
-                    info['reward_type'] = 'continuous_pnl'
+                    baseline_pnl = 0
+
+                # Alpha = actual PnL - baseline PnL (outperformance vs passive strategy)
+                alpha = pnl_delta - baseline_pnl
+
+                if alpha > 0:
+                    reward += alpha * self.profit_scaling
+                else:
+                    reward += alpha * self.loss_scaling
+
+                info['alpha'] = alpha
+                info['baseline_pnl'] = baseline_pnl
+                info['market_move'] = market_move_pips
+                info['reward_type'] = 'alpha_reward'
             else:
-                # Sparse mode: track delta but don't reward until exit
-                info['reward_type'] = 'sparse_holding'
+                # Asymmetric PnL Scaling (fallback when alpha disabled)
+                if pnl_delta > 0:
+                    reward += pnl_delta * self.profit_scaling
+                else:
+                    reward += pnl_delta * self.loss_scaling
+                info['reward_type'] = 'continuous_pnl'
 
             info['unrealized_pnl'] = current_unrealized_pnl
             info['pnl_delta'] = pnl_delta
             self.prev_unrealized_pnl = current_unrealized_pnl
 
-            # Holding bonus - reward for staying in GROWING profitable trades
-            # Only triggers if:
-            # 1. Profit > 0.5x ATR (prevents camping on tiny profits)
-            # 2. Profit is GROWING (pnl_delta > 0) (prevents camping when price stalls)
-            min_profit_for_bonus = atr * 0.5  # Minimum 0.5x ATR profit required
-            profit_is_growing = pnl_delta > 0
-            if current_unrealized_pnl > min_profit_for_bonus and profit_is_growing and self.holding_bonus > 0:
-                reward += self.holding_bonus
-                info['holding_bonus_applied'] = True
-            
             # Underwater Decay Penalty - penalizes holding losing trades
             # Encourages cutting losses early, teaching agent to manage drawdown
             if current_unrealized_pnl < 0 and self.underwater_penalty_coef > 0:
@@ -1838,11 +1569,6 @@ class TradingEnv(gym.Env):
                             info['fomo_opportunity_cost'] = opportunity_cost
                             info['fomo_wrong_direction'] = True
 
-        # Chop penalty: holding position in ranging market
-        if self.position != 0 and chop > self.chop_threshold:
-            reward += self.chop_penalty
-            info['chop_triggered'] = True
-
         return reward, info
 
     def reset(
@@ -1856,20 +1582,6 @@ class TradingEnv(gym.Env):
         # Random starting point
         if options and 'start_idx' in options:
             self.current_idx = options['start_idx']
-        elif self.use_regime_sampling and self.regime_indices is not None:
-            # REGIME-BALANCED SAMPLING: Equal probability for each regime
-            # This prevents directional bias from unbalanced training data
-            available_regimes = [r for r in [0, 1, 2] if len(self.regime_indices[r]) > 0]
-            if len(available_regimes) > 0:
-                # Randomly pick a regime
-                chosen_regime = self.np_random.choice(available_regimes)
-                # Randomly pick a starting index from that regime
-                regime_idx = self.np_random.integers(0, len(self.regime_indices[chosen_regime]))
-                self.current_idx = self.regime_indices[chosen_regime][regime_idx]
-            else:
-                # Fallback to random if no regime indices available
-                max_start = max(self.start_idx + 1, self.end_idx - self.max_steps)
-                self.current_idx = self.np_random.integers(self.start_idx, max_start)
         else:
             # FIXED: Ensure valid range for random start
             max_start = max(self.start_idx + 1, self.end_idx - self.max_steps)
@@ -1886,11 +1598,10 @@ class TradingEnv(gym.Env):
         self.total_pnl = 0.0
         self.trades = []
         self.prev_unrealized_pnl = 0.0  # Reset for continuous PnL tracking
-        self._holding_bonus_paid = 0.0
-        self._holding_bonus_level = 0
         self._profit_high_water_mark = 0.0
         self.break_even_activated = False
         self.entry_atr = 0.0
+        self.entry_idx = self.current_idx
 
         # Warmup rolling window normalization with historical data
         # OPTIMIZED: Use vectorized numpy operations instead of per-element loops
@@ -1989,34 +1700,23 @@ class TradingEnv(gym.Env):
             final_unrealized = pnl_pips * self.position_size
             final_delta = final_unrealized - self.prev_unrealized_pnl
 
-            # v24 FIX: In sparse mode, reward FULL trade PnL
-            if self.use_sparse_rewards:
-                forced_close_reward = final_unrealized * self.reward_scaling
-            else:
-                # v32 FIX: Apply alpha to forced close reward
-                if self.use_alpha_reward and self.current_idx > 0:
-                    current_price = self.close_prices[self.current_idx]
-                    prev_price = self.close_prices[self.current_idx - 1]
-                    market_move_pips = (current_price - prev_price) / self.pip_value
-                    # v41 FIX: Directional baseline (long→B&H, short→S&H)
-                    if self.position == 1:
-                        exit_baseline = market_move_pips * self.alpha_baseline_exposure * self.position_size
-                    else:
-                        exit_baseline = -market_move_pips * self.alpha_baseline_exposure * self.position_size
-                    exit_alpha = final_delta - exit_baseline
-                    # Direction-compensated rewards
-                    if self.position == -1:  # Short position
-                        if exit_alpha > 0:
-                            forced_close_reward = exit_alpha * self.profit_scaling * self.short_profit_multiplier
-                        else:
-                            forced_close_reward = exit_alpha * self.loss_scaling * self.short_loss_multiplier
-                    else:  # Long position
-                        if exit_alpha > 0:
-                            forced_close_reward = exit_alpha * self.profit_scaling
-                        else:
-                            forced_close_reward = exit_alpha * self.loss_scaling
+            # v32 FIX: Apply alpha to forced close reward
+            if self.use_alpha_reward and self.current_idx > 0:
+                current_price = self.close_prices[self.current_idx]
+                prev_price = self.close_prices[self.current_idx - 1]
+                market_move_pips = (current_price - prev_price) / self.pip_value
+                # v41 FIX: Directional baseline (long->B&H, short->S&H)
+                if self.position == 1:
+                    exit_baseline = market_move_pips * self.alpha_baseline_exposure * self.position_size
                 else:
-                    forced_close_reward = final_delta * self.reward_scaling
+                    exit_baseline = -market_move_pips * self.alpha_baseline_exposure * self.position_size
+                exit_alpha = final_delta - exit_baseline
+                if exit_alpha > 0:
+                    forced_close_reward = exit_alpha * self.profit_scaling
+                else:
+                    forced_close_reward = exit_alpha * self.loss_scaling
+            else:
+                forced_close_reward = final_delta * self.reward_scaling
             reward += forced_close_reward
 
             self.total_pnl += final_unrealized
@@ -2035,8 +1735,6 @@ class TradingEnv(gym.Env):
             self.position_size = 0.0
             self.entry_price = 0.0
             self.prev_unrealized_pnl = 0.0
-            self._holding_bonus_paid = 0.0
-            self._holding_bonus_level = 0
             self._profit_high_water_mark = 0.0
             self.break_even_activated = False
             self.entry_atr = 0.0
@@ -2106,7 +1804,9 @@ class TradingEnv(gym.Env):
 
     def close(self):
         """Clean up resources."""
-        del self._precomputed_contexts
+        for attr in ('_precomputed_contexts', '_precomputed_probs', '_precomputed_activations'):
+            if hasattr(self, attr):
+                delattr(self, attr)
         gc.collect()
 
 
@@ -2222,47 +1922,37 @@ def create_env_from_dataframes(
     lookback_start = max(0, start_idx - rolling_window_size)
     rolling_lookback_data = df_15m[available_cols].values[lookback_start:start_idx].astype(np.float32)
 
-    # Extract config values (defaults matching config/settings.py TradingConfig)
-    pip_value = 1.0                 # US30: 1 point = 1.0 price movement
-    spread_pips = 10.0              # config.trading.spread_pips
-    fomo_penalty = 0.0              # DEPRECATED - now using opportunity cost
-    chop_penalty = 0.0              # Disabled
-    fomo_threshold_atr = 4.0        # config.trading.fomo_threshold_atr
-    fomo_lookback_bars = 24         # config.trading.fomo_lookback_bars
-    chop_threshold = 80.0           # config.trading.chop_threshold
-    reward_scaling = 0.01           # config.trading.reward_scaling
-    # Symmetric PnL Scaling
-    profit_scaling = 0.01           # config.trading.profit_scaling
-    loss_scaling = 0.01             # config.trading.loss_scaling
-    # Alpha-Based Reward
-    use_alpha_reward = True         # config.trading.use_alpha_reward
-    alpha_baseline_exposure = 0.7   # config.trading.alpha_baseline_exposure
-    holding_bonus = 0.0             # config.trading.holding_bonus (DEPRECATED)
-    sl_atr_multiplier = 2.0         # config.trading.sl_atr_multiplier
-    tp_atr_multiplier = 6.0         # config.trading.tp_atr_multiplier
-    use_stop_loss = True            # config.trading.use_stop_loss
-    use_take_profit = True          # config.trading.use_take_profit
+    # Extract config values — pull from default_config to stay in sync with settings.py
+    _tc = default_config.trading
+    _ic = default_config.instrument
+    pip_value = _ic.pip_value
+    spread_pips = _tc.spread_pips
+    fomo_threshold_atr = _tc.fomo_threshold_atr
+    fomo_lookback_bars = _tc.fomo_lookback_bars
+    chop_threshold = _tc.chop_threshold
+    reward_scaling = _tc.reward_scaling
+    profit_scaling = _tc.profit_scaling
+    loss_scaling = _tc.loss_scaling
+    use_alpha_reward = _tc.use_alpha_reward
+    alpha_baseline_exposure = _tc.alpha_baseline_exposure
+    sl_atr_multiplier = _tc.sl_atr_multiplier
+    tp_atr_multiplier = _tc.tp_atr_multiplier
+    use_stop_loss = _tc.use_stop_loss
+    use_take_profit = _tc.use_take_profit
     volatility_sizing = True
-    risk_per_trade = 100.0          # config.trading.risk_per_trade
-    enforce_analyst_alignment = False  # config.trading.enforce_analyst_alignment
+    risk_per_trade = _tc.risk_per_trade
     num_classes = 2
-    # Early Exit Penalty defaults
-    early_exit_penalty = 0.0        # config.trading.early_exit_penalty (DEPRECATED)
-    min_bars_before_exit = 0        # config.trading.min_bars_before_exit
     rolling_norm_min_samples = 1
 
-    # Opportunity Cost & Underwater defaults (matching config/settings.py)
-    opportunity_cost_multiplier = 0.0  # config.trading.opportunity_cost_multiplier
-    opportunity_cost_cap = 0.2      # config.trading.opportunity_cost_cap
-    underwater_penalty_coef = 0.5   # config.trading.underwater_penalty_coef
-    underwater_threshold_atr = 1.5  # config.trading.underwater_threshold_atr
-    break_even_atr = 2.0            # config.trading.break_even_atr
+    opportunity_cost_multiplier = _tc.opportunity_cost_multiplier
+    opportunity_cost_cap = _tc.opportunity_cost_cap
+    underwater_penalty_coef = _tc.underwater_penalty_coef
+    underwater_threshold_atr = _tc.underwater_threshold_atr
+    break_even_atr = _tc.break_even_atr
 
     if config is not None:
         pip_value = getattr(config, 'pip_value', pip_value)
         spread_pips = getattr(config, 'spread_pips', spread_pips)
-        fomo_penalty = getattr(config, 'fomo_penalty', fomo_penalty)
-        chop_penalty = getattr(config, 'chop_penalty', chop_penalty)
         fomo_threshold_atr = getattr(config, 'fomo_threshold_atr', fomo_threshold_atr)
         fomo_lookback_bars = getattr(config, 'fomo_lookback_bars', fomo_lookback_bars)
         chop_threshold = getattr(config, 'chop_threshold', chop_threshold)
@@ -2273,18 +1963,13 @@ def create_env_from_dataframes(
         # Alpha-Based Reward
         use_alpha_reward = getattr(config, 'use_alpha_reward', use_alpha_reward)
         alpha_baseline_exposure = getattr(config, 'alpha_baseline_exposure', alpha_baseline_exposure)
-        holding_bonus = getattr(config, 'holding_bonus', holding_bonus)
         sl_atr_multiplier = getattr(config, 'sl_atr_multiplier', sl_atr_multiplier)
         tp_atr_multiplier = getattr(config, 'tp_atr_multiplier', tp_atr_multiplier)
         use_stop_loss = getattr(config, 'use_stop_loss', use_stop_loss)
         use_take_profit = getattr(config, 'use_take_profit', use_take_profit)
         volatility_sizing = getattr(config, 'volatility_sizing', volatility_sizing)
         risk_per_trade = getattr(config, 'risk_per_trade', risk_per_trade)
-        enforce_analyst_alignment = getattr(config, 'enforce_analyst_alignment', enforce_analyst_alignment)
         noise_level = getattr(config, 'noise_level', noise_level)
-        # Early Exit Penalty
-        early_exit_penalty = getattr(config, 'early_exit_penalty', -0.1)
-        min_bars_before_exit = getattr(config, 'min_bars_before_exit', 10)
         rolling_norm_min_samples = getattr(config, 'rolling_norm_min_samples', rolling_norm_min_samples)
         
         # Opportunity Cost & Underwater Config
@@ -2312,8 +1997,6 @@ def create_env_from_dataframes(
         # Config Params (US30)
         pip_value=pip_value,
         spread_pips=spread_pips,
-        fomo_penalty=fomo_penalty,
-        chop_penalty=chop_penalty,
         fomo_threshold_atr=fomo_threshold_atr,
         fomo_lookback_bars=fomo_lookback_bars,
         chop_threshold=chop_threshold,
@@ -2323,22 +2006,17 @@ def create_env_from_dataframes(
         # Alpha-Based Reward
         use_alpha_reward=use_alpha_reward,
         alpha_baseline_exposure=alpha_baseline_exposure,
-        holding_bonus=holding_bonus,
         sl_atr_multiplier=sl_atr_multiplier,
         tp_atr_multiplier=tp_atr_multiplier,
         use_stop_loss=use_stop_loss,
         use_take_profit=use_take_profit,
         volatility_sizing=volatility_sizing,
         risk_per_trade=risk_per_trade,
-        enforce_analyst_alignment=enforce_analyst_alignment,
         num_classes=num_classes,
         # Visualization data
         ohlc_data=ohlc_data,
         timestamps=timestamps,
         noise_level=noise_level,
-        # Early Exit Penalty
-        early_exit_penalty=early_exit_penalty,
-        min_bars_before_exit=min_bars_before_exit,
         # Rolling window warmup data
         rolling_lookback_data=rolling_lookback_data,
         rolling_norm_min_samples=rolling_norm_min_samples,

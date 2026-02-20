@@ -31,7 +31,6 @@ import torch
 
 from config.settings import Config, BridgeConfig, get_device
 from src.agents.sniper_agent import SniperAgent
-from src.agents.recurrent_agent import RecurrentSniperAgent
 from src.data.features import engineer_all_features
 from src.data.normalizer import FeatureNormalizer
 from src.data.resampler import resample_all_timeframes, align_timeframes
@@ -389,8 +388,9 @@ def _build_observation(
         else:
             unrealized_pnl = (entry_price - current_price) / pip_value
         unrealized_pnl *= float(position_size)
-        # FIX: Match TradingEnv - normalize by atr_safe, not fixed 100
-        unrealized_pnl_norm = float(unrealized_pnl / atr_safe)
+        # FIX: Match TradingEnv - divide by position_size so unrealized_pnl_norm
+        # is on same scale as entry_price_norm (per-unit, not sized)
+        unrealized_pnl_norm = float(unrealized_pnl / max(position_size, 0.01) / atr_safe)
     else:
         entry_price_norm = 0.0
         unrealized_pnl_norm = 0.0
@@ -447,8 +447,8 @@ def _build_observation(
         pip_value_calc = float(agent_env_cfg.instrument.pip_value)
 
         # Profit Progress: How far toward TP (0 = entry, 1 = at TP)
-        # unrealized_pnl is already calculated above in pip units
-        unrealized_price_units = unrealized_pnl * pip_value_calc  # Convert to price units
+        # FIX: Divide by position_size to match TradingEnv (per-unit, not sized PnL)
+        unrealized_price_units = (unrealized_pnl / max(position_size, 0.01)) * pip_value_calc  # Convert to price units
         profit_progress = float(np.clip(unrealized_price_units / tp_target, -1.0, 1.0))
 
         # Distance to TP as percentage (1 = at entry, 0 = at TP)
@@ -600,28 +600,15 @@ class MT5BridgeState:
         obs_dim = self._expected_obs_dim()
         dummy_env = _make_dummy_env(obs_dim)
 
-        # Detect if this is a recurrent model by checking for marker file
-        # Check both standard and recurrent directories
-        recurrent_marker = system_cfg.paths.models_agent_recurrent / ".recurrent"
-        recurrent_model_path = system_cfg.paths.models_agent_recurrent / "final_model.zip"
         standard_model_path = system_cfg.paths.models_agent / "final_model.zip"
 
-        self.is_recurrent = False
         if cfg.model_path is not None:
-            # Load custom model checkpoint (always standard PPO, not recurrent)
             custom_path = Path(cfg.model_path)
             if not custom_path.exists():
                 raise FileNotFoundError(f"Custom model not found: {custom_path}")
             self.agent = SniperAgent.load(str(custom_path), dummy_env, device="cpu")
             logger.info("Loaded custom PPO agent from %s", custom_path)
-        elif recurrent_marker.exists() and recurrent_model_path.exists():
-            # Load recurrent model
-            self.is_recurrent = True
-            self.agent = RecurrentSniperAgent.load(str(recurrent_model_path), dummy_env, device="cpu")
-            self.agent.reset_lstm_states()
-            logger.info("Loaded RecurrentPPO agent from %s", recurrent_model_path)
         else:
-            # Load standard PPO model
             self.agent = SniperAgent.load(str(standard_model_path), dummy_env, device="cpu")
             logger.info("Loaded standard PPO agent from %s", standard_model_path)
 
@@ -1099,26 +1086,11 @@ class MT5BridgeState:
             self.last_decision_label_utc = label
             return {"action": 999, "reason": "dry_run", **obs_info}
 
-        # Detect episode boundary for LSTM state management
-        # Episode boundary = position changed from open to flat
-        episode_start = (self._last_position != 0 and position == 0)
-        self._last_position = position
-
-        if self.is_recurrent:
-            # RecurrentPPO needs episode_start flag for LSTM state management
-            action, _ = self.agent.predict(
-                obs,
-                deterministic=True,
-                episode_start=episode_start,
-                min_action_confidence=float(self.system_cfg.trading.min_action_confidence),
-            )
-        else:
-            # Standard PPO
-            action, _ = self.agent.predict(
-                obs,
-                deterministic=True,
-                min_action_confidence=float(self.system_cfg.trading.min_action_confidence),
-            )
+        action, _ = self.agent.predict(
+            obs,
+            deterministic=True,
+            min_action_confidence=float(self.system_cfg.trading.min_action_confidence),
+        )
         t_agent = time.time()
 
         # LOG TIMING BREAKDOWN

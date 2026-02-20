@@ -107,12 +107,15 @@ class TestFeatureOrderingParity:
 
         # v35: Added 4 percentile features for regime-robust normalization
         # v37: Added 4 training-anchored OOD features (fixed stats, never adapt)
-        # Mean reversion: 4 features (bb_percent_b, bb_bandwidth, williams_r, rsi, rsi_divergence)
+        # Mean reversion: 5 features (bb_percent_b, bb_bandwidth, williams_r, rsi, rsi_divergence)
         expected_cols = [
             "returns", "volatility",
-            "sma_distance", "dist_to_resistance",
+            "sma_distance",
+            "ema_gap", "ema_acceleration", "ema_crossover_recency",
+            "dist_to_resistance",
             "dist_to_support", "sr_strength_r", "sr_strength_s",
             "session_asian", "session_london", "session_ny",
+            # v2 Structure Features (continuous, RL-friendly)
             "structure_fade", "bars_since_bos", "bars_since_choch",
             "bos_magnitude", "choch_magnitude",
             "bos_streak",
@@ -123,7 +126,7 @@ class TestFeatureOrderingParity:
             # v37 OOD FIX: Training-anchored features (FIXED stats, never adapt)
             "volatility_vs_training", "returns_skew_shift", "atr_vs_training",
             "ood_score",
-            # Mean Reversion Features (4)
+            # Mean Reversion Features (5)
             "bb_percent_b", "bb_bandwidth", "williams_r",
             "rsi", "rsi_divergence",
         ]
@@ -140,15 +143,18 @@ class TestFeatureOrderingParity:
 
         # v35: Added 4 percentile features for regime-robust normalization
         # v37: Added 4 training-anchored OOD features (fixed stats, never adapt)
-        # Mean reversion: 4 features (bb_percent_b, bb_bandwidth, williams_r, rsi, rsi_divergence)
+        # Mean reversion: 5 features (bb_percent_b, bb_bandwidth, williams_r, rsi, rsi_divergence)
         expected_cols = [
             "atr", "chop", "adx", "sma_distance",
+            "ema_gap", "ema_acceleration", "ema_crossover_recency",
             "dist_to_support", "dist_to_resistance",
             "sr_strength_r", "sr_strength_s", "session_asian",
             "session_london", "session_ny",
+            # v2 Structure Features (continuous, RL-friendly)
             "structure_fade", "bars_since_bos", "bars_since_choch",
             "bos_magnitude", "choch_magnitude",
             "bos_streak",
+            # Extra model features so PPO can learn without Analyst context.
             "returns", "volatility",
             "atr_context",
             # v35 FIX: Regime-robust percentile features
@@ -157,7 +163,7 @@ class TestFeatureOrderingParity:
             # v37 OOD FIX: Training-anchored features (FIXED stats, never adapt)
             "volatility_vs_training", "returns_skew_shift", "atr_vs_training",
             "ood_score",
-            # Mean Reversion Features (4)
+            # Mean Reversion Features (5)
             "bb_percent_b", "bb_bandwidth", "williams_r",
             "rsi", "rsi_divergence",
         ]
@@ -169,19 +175,19 @@ class TestFeatureOrderingParity:
         )
 
     def test_market_feature_count(self):
-        """Market features should have exactly 33 columns (20 base + 4 percentile + 4 v37 + 5 mean reversion)."""
+        """Market features should have exactly 36 columns (23 base + 4 percentile + 4 v37 + 5 mean reversion)."""
         from src.live.bridge_constants import MARKET_FEATURE_COLS
 
-        assert len(MARKET_FEATURE_COLS) == 33, (
-            f"Expected 33 market features, got {len(MARKET_FEATURE_COLS)}"
+        assert len(MARKET_FEATURE_COLS) == 36, (
+            f"Expected 36 market features, got {len(MARKET_FEATURE_COLS)}"
         )
 
     def test_model_feature_count(self):
-        """Model features should have exactly 30 columns (17 base + 4 percentile + 4 v37 + 5 mean reversion)."""
+        """Model features should have exactly 33 columns (20 base + 4 percentile + 4 v37 + 5 mean reversion)."""
         from src.live.bridge_constants import MODEL_FEATURE_COLS
 
-        assert len(MODEL_FEATURE_COLS) == 30, (
-            f"Expected 30 model features, got {len(MODEL_FEATURE_COLS)}"
+        assert len(MODEL_FEATURE_COLS) == 33, (
+            f"Expected 33 model features, got {len(MODEL_FEATURE_COLS)}"
         )
 
 

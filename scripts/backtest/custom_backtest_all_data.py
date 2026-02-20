@@ -317,8 +317,8 @@ def main():
         use_stop_loss=bool(cfg.trading.use_stop_loss),
         use_take_profit=bool(cfg.trading.use_take_profit),
         min_hold_bars=int(cfg.trading.min_hold_bars),
-        break_even_atr=float(cfg.trading.break_even_atr),
-        early_exit_profit_atr=float(cfg.trading.early_exit_profit_atr),
+        break_even_atr=0.0,
+        early_exit_profit_atr=0.0,
     )
     
     elapsed = time.time() - start_time

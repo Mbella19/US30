@@ -365,8 +365,6 @@ def _build_rollout_env(
         device=torch.device("cpu"),
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
-        regime_labels=None,
-        use_regime_sampling=False,
         precomputed_analyst_cache=None,
         ohlc_data=ohlc_data,
         timestamps=timestamps,
